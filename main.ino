@@ -6,7 +6,10 @@
  * メイン画面: タッチ左右でメニュー切替、ダイヤル回転対応予定
  */
 
-#include <M5Unified.h>
+#include <M5Dial.h>
+#include <TinyGPSPlus.h>
+#include <SPIFFS.h>
+#include <ArduinoJson.h>
 
 // ============================================================
 // ビットマップアイコンデータ（PNG, PROGMEM）
@@ -268,6 +271,42 @@ static const IconData icons[5] = {
 const char* modNames[MOD_COUNT] = { "GPS", "OBD", "NFC", "WiFi" };
 bool modReady[MOD_COUNT] = { false, false, false, false };
 
+// ============================================================
+// NFC関連
+// ============================================================
+
+
+// GPS
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(1);
+#define GPS_RX 1  // PORT.A: GPS TX → M5Dial G1
+#define GPS_TX 2  // PORT.A: GPS RX → M5Dial G2
+// 基準点（会社座標）※仮: 自宅
+#define BASE_LAT 43.802500
+#define BASE_LNG 143.815800
+#define RETURN_RADIUS 150.0  // 帰社判定半径（メートル）
+
+// 最遠地点記録
+double farthestLat = 0.0;
+double farthestLng = 0.0;
+double farthestDist = 0.0;
+
+// 運行状態
+bool tripActive = false;
+
+// 画面状態
+enum Screen { SCREEN_MENU, SCREEN_GPS };
+Screen currentScreen = SCREEN_MENU;
+
+// ドライバー情報
+String currentDriverUID = "";
+String displayUID = "";
+bool nfcReady = false;
+unsigned long lastNfcRead = 0;
+long lastEncoderPos = 0;
+
+#define NFC_READ_INTERVAL 500  // 読み取り間隔(ms)
+
 const int modX[MOD_COUNT] = { 52, 96, 140, 184 };
 const int modY[MOD_COUNT] = { 200, 200, 200, 200 };
 const int dotR = 4;
@@ -314,22 +353,17 @@ unsigned long transitionStart = 0;
 // ============================================================
 
 void drawBackground() {
-  M5.Display.fillScreen(COL_BG);
-  for (int r = SCREEN_R; r > 20; r -= 2) {
-    uint8_t g = map(r, 20, SCREEN_R, 20, 4);
-    uint16_t col = M5.Display.color565(0, g, g / 3);
-    M5.Display.drawCircle(CX, CY, r, col);
-  }
+  M5Dial.Display.fillScreen(COL_BG);
 }
 
 void drawHexGrid() {
-  uint16_t col = M5.Display.color565(10, 40, 20);
+  uint16_t col = M5Dial.Display.color565(10, 40, 20);
   const int hexPoints[][2] = {
     {120, 20}, {150, 37}, {150, 71}, {120, 88}, {90, 71}, {90, 37}
   };
   for (int i = 0; i < 6; i++) {
     int next = (i + 1) % 6;
-    M5.Display.drawLine(hexPoints[i][0], hexPoints[i][1],
+    M5Dial.Display.drawLine(hexPoints[i][0], hexPoints[i][1],
                         hexPoints[next][0], hexPoints[next][1], col);
   }
   const int hex2[][2] = {
@@ -337,23 +371,23 @@ void drawHexGrid() {
   };
   for (int i = 0; i < 6; i++) {
     int next = (i + 1) % 6;
-    M5.Display.drawLine(hex2[i][0], hex2[i][1],
+    M5Dial.Display.drawLine(hex2[i][0], hex2[i][1],
                         hex2[next][0], hex2[next][1], col);
   }
 }
 
 void drawCornerBrackets() {
-  uint16_t col = M5.Display.color565(15, 60, 30);
+  uint16_t col = M5Dial.Display.color565(15, 60, 30);
   int len = 10;
   int margin = 28;
-  M5.Display.drawLine(margin, margin, margin + len, margin, col);
-  M5.Display.drawLine(margin, margin, margin, margin + len, col);
-  M5.Display.drawLine(240 - margin, margin, 240 - margin - len, margin, col);
-  M5.Display.drawLine(240 - margin, margin, 240 - margin, margin + len, col);
-  M5.Display.drawLine(margin, 240 - margin, margin + len, 240 - margin, col);
-  M5.Display.drawLine(margin, 240 - margin, margin, 240 - margin - len, col);
-  M5.Display.drawLine(240 - margin, 240 - margin, 240 - margin - len, 240 - margin, col);
-  M5.Display.drawLine(240 - margin, 240 - margin, 240 - margin, 240 - margin - len, col);
+  M5Dial.Display.drawLine(margin, margin, margin + len, margin, col);
+  M5Dial.Display.drawLine(margin, margin, margin, margin + len, col);
+  M5Dial.Display.drawLine(240 - margin, margin, 240 - margin - len, margin, col);
+  M5Dial.Display.drawLine(240 - margin, margin, 240 - margin, margin + len, col);
+  M5Dial.Display.drawLine(margin, 240 - margin, margin + len, 240 - margin, col);
+  M5Dial.Display.drawLine(margin, 240 - margin, margin, 240 - margin - len, col);
+  M5Dial.Display.drawLine(240 - margin, 240 - margin, 240 - margin - len, 240 - margin, col);
+  M5Dial.Display.drawLine(240 - margin, 240 - margin, 240 - margin, 240 - margin - len, col);
 }
 
 void drawGaugeBackground() {
@@ -361,10 +395,10 @@ void drawGaugeBackground() {
     float rad = deg * PI / 180.0;
     int x = GAUGE_CX + (int)(GAUGE_R * cos(rad));
     int y = GAUGE_CY + (int)(GAUGE_R * sin(rad));
-    M5.Display.drawPixel(x, y, COL_GREEN_DIM);
+    M5Dial.Display.drawPixel(x, y, COL_GREEN_DIM);
     x = GAUGE_CX + (int)((GAUGE_R - 1) * cos(rad));
     y = GAUGE_CY + (int)((GAUGE_R - 1) * sin(rad));
-    M5.Display.drawPixel(x, y, COL_GREEN_DIM);
+    M5Dial.Display.drawPixel(x, y, COL_GREEN_DIM);
   }
   for (int i = 0; i < 7; i++) {
     int deg = -210 + i * 40;
@@ -373,50 +407,50 @@ void drawGaugeBackground() {
     int y1 = GAUGE_CY + (int)(GAUGE_R * sin(rad));
     int x2 = GAUGE_CX + (int)((GAUGE_R - 7) * cos(rad));
     int y2 = GAUGE_CY + (int)((GAUGE_R - 7) * sin(rad));
-    M5.Display.drawLine(x1, y1, x2, y2, COL_GREEN_DIM);
+    M5Dial.Display.drawLine(x1, y1, x2, y2, COL_GREEN_DIM);
   }
-  M5.Display.drawCircle(GAUGE_CX, GAUGE_CY, 28, COL_GREEN_DIM);
+  M5Dial.Display.drawCircle(GAUGE_CX, GAUGE_CY, 28, COL_GREEN_DIM);
 }
 
 void drawGpsPin(uint16_t col) {
   int cx = GAUGE_CX;
   int cy = GAUGE_CY;
-  M5.Display.drawCircle(cx, cy - 6, 8, col);
-  M5.Display.drawLine(cx - 6, cy - 1, cx, cy + 10, col);
-  M5.Display.drawLine(cx + 6, cy - 1, cx, cy + 10, col);
-  M5.Display.drawCircle(cx, cy - 6, 3, col);
+  M5Dial.Display.drawCircle(cx, cy - 6, 8, col);
+  M5Dial.Display.drawLine(cx - 6, cy - 1, cx, cy + 10, col);
+  M5Dial.Display.drawLine(cx + 6, cy - 1, cx, cy + 10, col);
+  M5Dial.Display.drawCircle(cx, cy - 6, 3, col);
 }
 
 void drawKCBText() {
-  M5.Display.setTextColor(COL_GREEN);
-  M5.Display.setTextDatum(top_center);
-  M5.Display.setFont(&fonts::FreeSansBold18pt7b);
-  M5.Display.drawString("KCB", CX, 140);
-  M5.Display.setFont(&fonts::lgfxJapanGothic_16);
-  M5.Display.setTextColor(M5.Display.color565(40, 140, 70));
-  M5.Display.drawString("運行管理システム", CX, 177);
+  M5Dial.Display.setTextColor(COL_GREEN);
+  M5Dial.Display.setTextDatum(top_center);
+  M5Dial.Display.setFont(&fonts::FreeSansBold18pt7b);
+  M5Dial.Display.drawString("KCB", CX, 140);
+  M5Dial.Display.setFont(&fonts::lgfxJapanGothic_16);
+  M5Dial.Display.setTextColor(M5Dial.Display.color565(40, 140, 70));
+  M5Dial.Display.drawString("運行管理システム", CX, 177);
 }
 
 void drawModuleIndicators() {
-  M5.Display.setFont(&fonts::Font0);
-  M5.Display.setTextSize(1);
-  M5.Display.setTextDatum(middle_left);
+  M5Dial.Display.setFont(&fonts::Font0);
+  M5Dial.Display.setTextSize(1);
+  M5Dial.Display.setTextDatum(middle_left);
   for (int i = 0; i < MOD_COUNT; i++) {
     int x = modX[i];
     int y = modY[i];
     if (modReady[i]) {
-      M5.Display.fillCircle(x, y, dotR, COL_GREEN);
+      M5Dial.Display.fillCircle(x, y, dotR, COL_GREEN);
     } else {
-      M5.Display.drawCircle(x, y, dotR, COL_GRAY_DIM);
+      M5Dial.Display.drawCircle(x, y, dotR, COL_GRAY_DIM);
     }
   }
-  M5.Display.setTextDatum(top_center);
-  M5.Display.setFont(&fonts::Font0);
-  M5.Display.setTextSize(1);
+  M5Dial.Display.setTextDatum(top_center);
+  M5Dial.Display.setFont(&fonts::Font0);
+  M5Dial.Display.setTextSize(1);
   for (int i = 0; i < MOD_COUNT; i++) {
     uint16_t col = modReady[i] ? COL_GREEN : COL_GRAY_DIM;
-    M5.Display.setTextColor(col);
-    M5.Display.drawString(modNames[i], modX[i], modY[i] + dotR + 3);
+    M5Dial.Display.setTextColor(col);
+    M5Dial.Display.drawString(modNames[i], modX[i], modY[i] + dotR + 3);
   }
 }
 
@@ -426,16 +460,29 @@ void drawGaugeActive() {
     for (int t = 0; t < 3; t++) {
       int x = GAUGE_CX + (int)((GAUGE_R - t) * cos(rad));
       int y = GAUGE_CY + (int)((GAUGE_R - t) * sin(rad));
-      M5.Display.drawPixel(x, y, COL_GREEN);
+      M5Dial.Display.drawPixel(x, y, COL_GREEN);
     }
     if (deg % 10 == 0) delay(5);
   }
-  float needleDeg = -130.0 * PI / 180.0;
-  int nx = GAUGE_CX + (int)(50 * cos(needleDeg));
-  int ny = GAUGE_CY + (int)(50 * sin(needleDeg));
-  M5.Display.drawLine(GAUGE_CX, GAUGE_CY, nx, ny, COL_GREEN);
-  M5.Display.drawLine(GAUGE_CX + 1, GAUGE_CY, nx + 1, ny, COL_GREEN);
-  M5.Display.fillCircle(GAUGE_CX, GAUGE_CY, 4, COL_GREEN);
+  // 針アニメーション（-210度から-130度まで徐々に移動）
+  for (int deg = -210; deg <= -130; deg += 2) {
+    // 前の針を消す（中心ドットより外側）
+    if (deg > -210) {
+      float prevRad = (deg - 2) * PI / 180.0;
+      int px = GAUGE_CX + (int)(50 * cos(prevRad));
+      int py = GAUGE_CY + (int)(50 * sin(prevRad));
+      M5Dial.Display.drawLine(GAUGE_CX, GAUGE_CY, px, py, COL_BG);
+      M5Dial.Display.drawLine(GAUGE_CX + 1, GAUGE_CY, px + 1, py, COL_BG);
+    }
+    // 新しい針を描画
+    float rad = deg * PI / 180.0;
+    int nx = GAUGE_CX + (int)(50 * cos(rad));
+    int ny = GAUGE_CY + (int)(50 * sin(rad));
+    M5Dial.Display.drawLine(GAUGE_CX, GAUGE_CY, nx, ny, COL_GREEN);
+    M5Dial.Display.drawLine(GAUGE_CX + 1, GAUGE_CY, nx + 1, ny, COL_GREEN);
+    M5Dial.Display.fillCircle(GAUGE_CX, GAUGE_CY, 4, COL_GREEN);
+    delay(8);
+  }
   drawGpsPin(COL_GREEN);
 }
 
@@ -456,13 +503,64 @@ void setModuleReady(int moduleIndex) {
   modReady[moduleIndex] = true;
   int x = modX[moduleIndex];
   int y = modY[moduleIndex];
-  M5.Display.fillCircle(x, y, dotR + 1, COL_BG);
-  M5.Display.fillCircle(x, y, dotR, COL_GREEN);
-  M5.Display.setFont(&fonts::Font0);
-  M5.Display.setTextSize(1);
-  M5.Display.setTextDatum(top_center);
-  M5.Display.setTextColor(COL_GREEN, COL_BG);
-  M5.Display.drawString(modNames[moduleIndex], x, y + dotR + 3);
+  M5Dial.Display.fillCircle(x, y, dotR + 1, COL_BG);
+  M5Dial.Display.fillCircle(x, y, dotR, COL_GREEN);
+  M5Dial.Display.setFont(&fonts::Font0);
+  M5Dial.Display.setTextSize(1);
+  M5Dial.Display.setTextDatum(top_center);
+  M5Dial.Display.setTextColor(COL_GREEN, COL_BG);
+  M5Dial.Display.drawString(modNames[moduleIndex], x, y + dotR + 3);
+}
+// ============================================================
+// NFC初期化・読み取り
+// ============================================================
+bool initNFC() {
+  // M5Dial.begin() が内蔵RFID(Wire1)を初期化済み
+  byte v = M5Dial.Rfid.PICC_IsNewCardPresent();  // ダミー呼び出しでウェイクアップ
+  // バージョン確認
+  byte ver = M5Dial.Rfid.PCD_ReadRegister(0x37);  // VersionReg = 0x37
+  if (ver == 0x00 || ver == 0xFF) {
+    Serial.println("NFC: WS1850S not found");
+    return false;
+  }
+  Serial.printf("NFC: WS1850S found (v=0x%02X)\n", ver);
+  return true;
+}
+
+String readNFCCard() {
+  if (!M5Dial.Rfid.PICC_IsNewCardPresent()) return "";
+  if (!M5Dial.Rfid.PICC_ReadCardSerial()) return "";
+  
+  String uid = "";
+  for (byte i = 0; i < M5Dial.Rfid.uid.size; i++) {
+    if (i > 0) uid += ":";
+    if (M5Dial.Rfid.uid.uidByte[i] < 0x10) uid += "0";
+    uid += String(M5Dial.Rfid.uid.uidByte[i], HEX);
+  }
+  uid.toUpperCase();
+  
+  M5Dial.Rfid.PICC_HaltA();
+  return uid;
+}
+
+void pollNFC() {
+  if (!nfcReady) return;
+  if (millis() - lastNfcRead < NFC_READ_INTERVAL) return;
+  lastNfcRead = millis();
+  
+  String uid = readNFCCard();
+  if (uid.length() > 0) {
+    currentDriverUID = uid;
+    displayUID = uid;
+    Serial.printf("NFC: Card detected UID=%s\n", uid.c_str());
+    
+    // ブザーフィードバック
+    M5Dial.Speaker.tone(2000, 80);
+    delay(80);
+    M5Dial.Speaker.tone(2600, 80);
+    
+    needsRedraw = true;
+  }
 }
 
 // ============================================================
@@ -471,21 +569,14 @@ void setModuleReady(int moduleIndex) {
 
 void drawMainScreen() {
   // 背景（ブート画面と同系色のダークグリーン）
-  M5.Display.fillScreen(COL_BG);
-  
-  // 中心に向かって少し明るくする放射状グラデ
-  for (int r = SCREEN_R; r > 40; r -= 3) {
-    uint8_t g = map(r, 40, SCREEN_R, 12, 2);
-    uint16_t col = M5.Display.color565(0, g, g / 3);
-    M5.Display.drawCircle(CX, CY, r, col);
-  }
+  M5Dial.Display.fillScreen(COL_BG);
   
   // アイコン軌道の弧（薄い線）
   for (int deg = -155; deg <= -25; deg++) {
     float rad = deg * PI / 180.0;
     int x = CX + (int)(ICON_ORBIT_R * cos(rad));
     int y = CY + (int)(ICON_ORBIT_R * sin(rad));
-    M5.Display.drawPixel(x, y, COL_DIM_LINE);
+    M5Dial.Display.drawPixel(x, y, COL_DIM_LINE);
   }
   
   // メニューアイコン描画
@@ -501,10 +592,10 @@ void drawMainScreen() {
   }
   
   // 下部ヒント
-  M5.Display.setFont(&fonts::lgfxJapanGothicP_12);
-  M5.Display.setTextColor(COL_DIM_LINE);
-  M5.Display.setTextDatum(middle_center);
-  M5.Display.drawString("< タッチで切替 >", CX, 225);
+  M5Dial.Display.setFont(&fonts::lgfxJapanGothicP_12);
+  M5Dial.Display.setTextColor(COL_DIM_LINE);
+  M5Dial.Display.setTextDatum(middle_center);
+  M5Dial.Display.drawString("< タッチで切替 >", CX, 225);
 }
 
 void drawMenuIcons() {
@@ -517,28 +608,18 @@ void drawMenuIcons() {
     int iconHalf = active ? 20 : 14;
     
     if (active) {
-      // グロー効果（アクティブアイコンの背景光）
-      uint16_t glowCol = menuItems[i].color;
-      // 薄い円でグロー表現
-      for (int r = iconHalf + 6; r > iconHalf + 2; r--) {
-        M5.Display.drawCircle(ix, iy, r, M5.Display.color565(
-          ((glowCol >> 11) & 0x1F) << 1,
-          ((glowCol >> 5) & 0x3F) >> 2,
-          (glowCol & 0x1F) >> 2
-        ));
-      }
-      // アクティブ背景円
-      M5.Display.fillCircle(ix, iy, iconHalf + 2, M5.Display.color565(8, 16, 8));
-      M5.Display.drawCircle(ix, iy, iconHalf + 2, menuItems[i].color);
+      // アクティブ: 塗りつぶし背景 + 枠線
+      M5Dial.Display.fillCircle(ix, iy, iconHalf + 2, M5Dial.Display.color565(10, 20, 10));
+      M5Dial.Display.drawCircle(ix, iy, iconHalf + 2, menuItems[i].color);
     } else {
-      // 非アクティブ背景円
-      M5.Display.fillCircle(ix, iy, iconHalf + 2, M5.Display.color565(4, 8, 4));
+      // 非アクティブ: 薄い背景のみ
+      M5Dial.Display.fillCircle(ix, iy, iconHalf + 1, M5Dial.Display.color565(4, 8, 4));
     }
     
     // PNGアイコン描画
     const uint8_t* iconData = active ? icons[i].active : icons[i].inactive;
     size_t iconLen = active ? icons[i].activeLen : icons[i].inactiveLen;
-    M5.Display.drawPng(iconData, iconLen, ix - iconHalf, iy - iconHalf);
+    M5Dial.Display.drawPng(iconData, iconLen, ix - iconHalf, iy - iconHalf);
   }
 }
 
@@ -547,73 +628,105 @@ void drawMenuIcons() {
 // ============================================================
 
 void drawStatusPage() {
-  M5.Display.setFont(&fonts::lgfxJapanGothicP_20);
-  M5.Display.setTextColor(COL_GREEN);
-  M5.Display.setTextDatum(middle_center);
-  M5.Display.drawString("待機中", CX, CY);
+  M5Dial.Display.setFont(&fonts::lgfxJapanGothicP_20);
+  M5Dial.Display.setTextColor(COL_GREEN);
+  M5Dial.Display.setTextDatum(middle_center);
+  M5Dial.Display.drawString("待機中", CX, CY);
   
-  M5.Display.setFont(&fonts::lgfxJapanGothicP_12);
-  M5.Display.setTextColor(COL_GREEN_DIM);
-  M5.Display.drawString("運転者: 未登録", CX, CY + 22);
-  M5.Display.drawString("運行: 停止", CX, CY + 38);
+  M5Dial.Display.setFont(&fonts::lgfxJapanGothicP_12);
+  M5Dial.Display.setTextColor(COL_GREEN_DIM);
+  M5Dial.Display.drawString("運転者: 未登録", CX, CY + 22);
+  M5Dial.Display.drawString("運行: 停止", CX, CY + 38);
 }
 
 void drawGpsPage() {
-  M5.Display.setFont(&fonts::lgfxJapanGothicP_16);
-  M5.Display.setTextColor(COL_CYAN);
-  M5.Display.setTextDatum(middle_center);
-  M5.Display.drawString("GPS情報", CX, CY - 10);
+  M5Dial.Display.setFont(&fonts::lgfxJapanGothicP_16);
+  M5Dial.Display.setTextColor(COL_CYAN);
+  M5Dial.Display.setTextDatum(middle_center);
+  M5Dial.Display.drawString("GPS情報", CX, CY - 10);
   
-  M5.Display.setFont(&fonts::lgfxJapanGothicP_12);
-  M5.Display.setTextColor(0x0410);
-  M5.Display.drawString("衛星: 受信待ち", CX, CY + 10);
-  M5.Display.drawString("最遠地点: ---", CX, CY + 26);
-  M5.Display.drawString("距離: ---", CX, CY + 42);
+  M5Dial.Display.setFont(&fonts::lgfxJapanGothicP_12);
+  M5Dial.Display.setTextColor(0x0410);
+  M5Dial.Display.drawString("衛星: 受信待ち", CX, CY + 10);
+  M5Dial.Display.drawString("最遠地点: ---", CX, CY + 26);
+  M5Dial.Display.drawString("距離: ---", CX, CY + 42);
 }
 
 void drawObdPage() {
-  M5.Display.setFont(&fonts::lgfxJapanGothicP_16);
-  M5.Display.setTextColor(COL_ORANGE);
-  M5.Display.setTextDatum(middle_center);
-  M5.Display.drawString("OBD2", CX, CY - 10);
+  M5Dial.Display.setFont(&fonts::lgfxJapanGothicP_16);
+  M5Dial.Display.setTextColor(COL_ORANGE);
+  M5Dial.Display.setTextDatum(middle_center);
+  M5Dial.Display.drawString("OBD2", CX, CY - 10);
   
-  M5.Display.setFont(&fonts::lgfxJapanGothicP_12);
-  M5.Display.setTextColor(0x7A00);
-  M5.Display.drawString("接続: 未接続", CX, CY + 10);
-  M5.Display.drawString("走行距離: ---", CX, CY + 26);
-  M5.Display.drawString("PID 0xA6: 未確認", CX, CY + 42);
+  M5Dial.Display.setFont(&fonts::lgfxJapanGothicP_12);
+  M5Dial.Display.setTextColor(0x7A00);
+  M5Dial.Display.drawString("接続: 未接続", CX, CY + 10);
+  M5Dial.Display.drawString("走行距離: ---", CX, CY + 26);
+  M5Dial.Display.drawString("PID 0xA6: 未確認", CX, CY + 42);
 }
 
 void drawDriverPage() {
-  M5.Display.setFont(&fonts::lgfxJapanGothicP_16);
-  M5.Display.setTextColor(COL_PURPLE);
-  M5.Display.setTextDatum(middle_center);
-  M5.Display.drawString("ドライバー", CX, CY - 10);
+  M5Dial.Display.setTextDatum(middle_center);
   
-  M5.Display.setFont(&fonts::lgfxJapanGothicP_12);
-  M5.Display.setTextColor(0x380F);
-  M5.Display.drawString("カード待機中", CX, CY + 10);
-  M5.Display.drawString("カードをタッチ", CX, CY + 30);
+  if (currentDriverUID.length() > 0) {
+    // --- カード読み取り済み ---
+    // チェックマークアイコン
+    M5Dial.Display.setFont(&fonts::lgfxJapanGothicP_20);
+    M5Dial.Display.setTextColor(COL_PURPLE);
+    M5Dial.Display.drawString("ドライバー", CX, CY - 28);
+    
+    // UID表示
+    M5Dial.Display.setFont(&fonts::Font0);
+    M5Dial.Display.setTextSize(1);
+    M5Dial.Display.setTextColor(0x780F);
+    M5Dial.Display.drawString("UID:", CX, CY + 2);
+    
+    M5Dial.Display.setFont(&fonts::lgfxJapanGothicP_12);
+    M5Dial.Display.setTextColor(COL_WHITE_DIM);
+    M5Dial.Display.drawString(displayUID, CX, CY + 18);
+    
+    // 登録済み表示
+    M5Dial.Display.setTextColor(COL_GREEN);
+    M5Dial.Display.drawString("登録済み", CX, CY + 42);
+  } else {
+    // --- 待機中 ---
+    M5Dial.Display.setFont(&fonts::lgfxJapanGothicP_16);
+    M5Dial.Display.setTextColor(COL_PURPLE);
+    M5Dial.Display.drawString("ドライバー", CX, CY - 20);
+    
+    M5Dial.Display.setFont(&fonts::lgfxJapanGothicP_12);
+    M5Dial.Display.setTextColor(0x380F);
+    M5Dial.Display.drawString("カード待機中", CX, CY + 4);
+    
+    // NFCタッチ促進の点滅風表示
+    uint16_t col = (millis() / 800 % 2 == 0) ? COL_PURPLE : 0x380F;
+    M5Dial.Display.setTextColor(col);
+    M5Dial.Display.drawString("NFCカードをタッチ", CX, CY + 28);
+    
+    if (!nfcReady) {
+      M5Dial.Display.setTextColor(0x7800);  // 赤系
+      M5Dial.Display.drawString("NFCモジュール未検出", CX, CY + 48);
+    }
+  }
 }
-
 void drawConfigPage() {
-  M5.Display.setFont(&fonts::lgfxJapanGothicP_16);
-  M5.Display.setTextColor(COL_GRAY);
-  M5.Display.setTextDatum(middle_center);
-  M5.Display.drawString("設定", CX, CY - 10);
+  M5Dial.Display.setFont(&fonts::lgfxJapanGothicP_16);
+  M5Dial.Display.setTextColor(COL_GRAY);
+  M5Dial.Display.setTextDatum(middle_center);
+  M5Dial.Display.drawString("設定", CX, CY - 10);
   
-  M5.Display.setFont(&fonts::lgfxJapanGothicP_12);
-  M5.Display.setTextColor(0x3186);
-  M5.Display.drawString("WiFi: 未接続", CX, CY + 10);
-  M5.Display.drawString("会社座標: 設定済", CX, CY + 26);
-  M5.Display.drawString("判定距離: 100m", CX, CY + 42);
+  M5Dial.Display.setFont(&fonts::lgfxJapanGothicP_12);
+  M5Dial.Display.setTextColor(0x3186);
+  M5Dial.Display.drawString("WiFi: 未接続", CX, CY + 10);
+  M5Dial.Display.drawString("会社座標: 設定済", CX, CY + 26);
+  M5Dial.Display.drawString("判定距離: 100m", CX, CY + 42);
 }
 
 // ============================================================
 // 入力処理
 // ============================================================
 void handleInput() {
-  auto t = M5.Touch.getDetail();
+  auto t = M5Dial.Touch.getDetail();
   
   // タッチ: 左半分=前、右半分=次
   if (t.wasPressed()) {
@@ -630,24 +743,190 @@ void handleInput() {
     }
   }
   
-  // ボタン押下: フィードバック
-  if (M5.BtnA.wasPressed()) {
-    M5.Display.fillCircle(CX, CY, 30, menuItems[selectedIndex].color);
-    delay(100);
-    needsRedraw = true;
+  // ダイヤル回転: メニュー切替
+  long newPos = M5Dial.Encoder.read();
+  long diff = newPos - lastEncoderPos;
+  if (diff >= 2) {
+    if (selectedIndex < MENU_COUNT - 1) {
+      selectedIndex++;
+      needsRedraw = true;
+    }
+    lastEncoderPos = newPos;
+  } else if (diff <= -2) {
+    if (selectedIndex > 0) {
+      selectedIndex--;
+      needsRedraw = true;
+    }
+    lastEncoderPos = newPos;
   }
+  
+  // ボタン押下: 画面遷移
+  if (M5Dial.BtnA.wasPressed()) {
+    if (currentScreen == SCREEN_MENU) {
+      if (selectedIndex == 1) {  // GPS情報
+        currentScreen = SCREEN_GPS;
+        drawGPSInfo();
+      } else {
+        // 他メニューは仮フィードバック
+        M5Dial.Display.fillCircle(CX, CY, 30, menuItems[selectedIndex].color);
+        delay(100);
+        needsRedraw = true;
+      }
+    } else {
+      // サブ画面からメニューに戻る
+      currentScreen = SCREEN_MENU;
+      needsRedraw = true;
+    }
+  }
+}
+
+void drawGPSInfo() {
+  auto& lcd = M5Dial.Display;
+  lcd.fillScreen(TFT_BLACK);
+  lcd.setTextColor(TFT_WHITE);
+  lcd.setTextSize(1);
+  lcd.setFont(&fonts::Font2);
+
+  lcd.setCursor(60, 30);
+  lcd.print("=== GPS Info ===");
+
+  if (gps.location.isValid()) {
+    lcd.setCursor(60, 60);
+    lcd.printf("Lat: %.6f", gps.location.lat());
+    lcd.setCursor(60, 80);
+    lcd.printf("Lng: %.6f", gps.location.lng());
+  } else {
+    lcd.setCursor(60, 60);
+    lcd.print("Lat: ---");
+    lcd.setCursor(60, 80);
+    lcd.print("Lng: ---");
+  }
+
+  lcd.setCursor(60, 110);
+  lcd.printf("Sats: %d", gps.satellites.value());
+
+  lcd.setCursor(60, 140);
+  if (gps.speed.isValid()) {
+    lcd.printf("Speed: %.1f km/h", gps.speed.kmph());
+  } else {
+    lcd.print("Speed: ---");
+  }
+
+  lcd.setCursor(60, 160);
+  lcd.printf("Chars: %lu", gps.charsProcessed());
+
+  lcd.setCursor(60, 170);
+  lcd.printf("Trip: %s", tripActive ? "Active" : "Idle");
+
+  lcd.setCursor(60, 190);
+  lcd.printf("Far: %.0f m", farthestDist);
+  lcd.setCursor(60, 200);
+  lcd.print("[DIAL] Back");
+}
+
+// 2点間の距離（メートル）を計算（ハーバーサイン公式）
+double calcDistance(double lat1, double lon1, double lat2, double lon2) {
+  double R = 6371000.0;
+  double dLat = radians(lat2 - lat1);
+  double dLon = radians(lon2 - lon1);
+  double a = sin(dLat / 2) * sin(dLat / 2) +
+             cos(radians(lat1)) * cos(radians(lat2)) *
+             sin(dLon / 2) * sin(dLon / 2);
+  double c = 2 * atan2(sqrt(a), sqrt(1 - a));
+  return R * c;
+}
+
+void updateFarthestPoint() {
+  if (!gps.location.isValid()) return;
+
+  double lat = gps.location.lat();
+  double lng = gps.location.lng();
+  double distFromBase = calcDistance(BASE_LAT, BASE_LNG, lat, lng);
+
+  // 基準点から離れたら運行開始
+  if (!tripActive && distFromBase > RETURN_RADIUS) {
+    tripActive = true;
+    farthestLat = lat;
+    farthestLng = lng;
+    farthestDist = distFromBase;
+  }
+
+  // 運行中: 最遠地点を更新
+  if (tripActive && distFromBase > farthestDist) {
+    farthestLat = lat;
+    farthestLng = lng;
+    farthestDist = distFromBase;
+  }
+
+  // 帰社判定
+  if (tripActive && distFromBase <= RETURN_RADIUS) {
+    saveTripLocal();  // ローカルに保存
+    tripActive = false;
+    farthestDist = 0.0;
+  }
+}
+
+// 運行記録をローカル保存
+void saveTripLocal() {
+  JsonDocument doc;
+  
+  // 既存データ読み込み
+  File f = SPIFFS.open("/trips.json", "r");
+  if (f) {
+    deserializeJson(doc, f);
+    f.close();
+  }
+  if (!doc.is<JsonArray>()) {
+    doc.to<JsonArray>();
+  }
+
+  JsonObject trip = doc.as<JsonArray>().add<JsonObject>();
+  trip["date"] = "2025-01-01";  // TODO: RTCから取得
+  trip["lat"] = farthestLat;
+  trip["lng"] = farthestLng;
+  trip["dist"] = farthestDist;
+  trip["driver"] = currentDriverUID;
+  
+  File out = SPIFFS.open("/trips.json", "w");
+  serializeJson(doc, out);
+  out.close();
+}
+
+// ドライバーマスタからUID照合
+String lookupDriver(String uid) {
+  File f = SPIFFS.open("/drivers.json", "r");
+  if (!f) return "unknown";
+
+  JsonDocument doc;
+  deserializeJson(doc, f);
+  f.close();
+
+  JsonArray arr = doc.as<JsonArray>();
+  for (JsonObject d : arr) {
+    if (d["uid"].as<String>() == uid) {
+      return d["name"].as<String>();
+    }
+  }
+  return "unregistered";
 }
 
 // ============================================================
 // Setup
 // ============================================================
 void setup() {
-  auto cfg = M5.config();
-  M5.begin(cfg);
-  
-  M5.Display.setRotation(0);
-  M5.Display.setBrightness(80);
-  
+  M5Dial.begin(true, true);  // enableEncoder=true, enableRFID=true
+  // GPS初期化
+  gpsSerial.begin(115200, SERIAL_8N1, GPS_RX, GPS_TX);
+
+  // SPIFFS初期化
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS mount failed");
+  }
+
+  M5Dial.Display.setRotation(0);
+  M5Dial.Display.setBrightness(80);
+  M5Dial.Speaker.setVolume(255);  // 0〜255（デフォルトは低め）
+
   // ========================================
   // ブートスクリーン
   // ========================================
@@ -660,7 +939,11 @@ void setup() {
   delay(400);
   setModuleReady(MOD_OBD);
   delay(400);
-  setModuleReady(MOD_NFC);
+  // NFC初期化（実際のハードウェア初期化）
+  nfcReady = initNFC();
+  if (nfcReady) {
+    setModuleReady(MOD_NFC);
+  }
   delay(400);
   setModuleReady(MOD_WIFI);
   
@@ -680,11 +963,28 @@ void setup() {
 // Main Loop
 // ============================================================
 void loop() {
-  M5.update();
+  M5Dial.update();
   
+  // GPSデータ読み取り
+  while (gpsSerial.available() > 0) {
+    gps.encode(gpsSerial.read());
+  }
+  // 最遠地点更新
+  updateFarthestPoint();
+
   if (appState == STATE_MAIN) {
+    // NFC読み取り（常時ポーリング＝どの画面でもカードタッチ受付）
+    pollNFC();
+    
     handleInput();
-    if (needsRedraw) {
+        // GPS画面の定期更新（1秒ごと）
+    static unsigned long lastGPSRedraw = 0;
+    if (currentScreen == SCREEN_GPS && millis() - lastGPSRedraw > 1000) {
+      drawGPSInfo();
+      lastGPSRedraw = millis();
+    }
+
+    if (needsRedraw && currentScreen == SCREEN_MENU) {
       drawMainScreen();
       needsRedraw = false;
     }
