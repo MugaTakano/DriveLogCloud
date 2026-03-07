@@ -1,0 +1,17 @@
+# Arduino IDE ビルド成果物
+build/
+*.elf
+*.bin
+*.hex
+*.map
+
+# OS系
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# エディタ系
+*.swp
+*.swo
+*~
+.vscode/
