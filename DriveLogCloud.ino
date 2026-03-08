@@ -11,8 +11,14 @@
 #include <SPIFFS.h>
 #include <ArduinoJson.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <mbedtls/md.h>
+#include <mbedtls/sha256.h>
+#include "secrets.h"  // gitignore対象
 
+#define AWS_REGION            "us-east-1"
+#define S3_HOST               "drive-log-cloud.s3.us-east-1.amazonaws.com"
 // ============================================================
 // ビットマップアイコンデータ（PNG, PROGMEM）
 // ============================================================
@@ -277,10 +283,6 @@ bool modReady[MOD_COUNT] = { false, false, false, false };
 // NFC関連
 // ============================================================
 
-// WiFi設定（初期値・コード埋め込み）
-const char* WIFI_SSID = "AirNet";      // ← 自宅WiFiのSSIDに書き換え
-const char* WIFI_PASS = "megu2527passb";   // ← パスワードに書き換え
-
 // WiFi接続（ノンブロッキング）
 bool wifiConnecting = false;
 unsigned long wifiConnectStart = 0;
@@ -298,9 +300,9 @@ const unsigned long ADDRESS_INTERVAL = 30000;  // 30秒ごとに更新
 #define GPS_RX 1  // PORT.A: GPS TX → M5Dial G1
 #define GPS_TX 2  // PORT.A: GPS RX → M5Dial G2
 
-// 基準点（会社座標）※仮: 自宅
-#define BASE_LAT 43.802500
-#define BASE_LNG 143.815800
+// 基準点（会社座標）
+#define BASE_LAT 43.804443
+#define BASE_LNG 143.892911
 #define RETURN_RADIUS 150.0  // 帰社判定半径（メートル）
 
 // 最遠地点記録
@@ -312,7 +314,7 @@ double farthestDist = 0.0;
 bool tripActive = false;
 
 // 画面状態
-enum Screen { SCREEN_MENU, SCREEN_GPS };
+enum Screen { SCREEN_MENU, SCREEN_GPS, SCREEN_OBD2, SCREEN_DRIVER, SCREEN_CONFIG };
 Screen currentScreen = SCREEN_MENU;
 
 // ドライバー情報
@@ -793,17 +795,38 @@ void drawDriverPage() {
     }
   }
 }
-void drawConfigPage() {
+
+void drawOBD2Page() {
+  M5Dial.Display.fillScreen(COL_BG);
   M5Dial.Display.setFont(&fonts::lgfxJapanGothicP_16);
   M5Dial.Display.setTextColor(COL_GRAY);
   M5Dial.Display.setTextDatum(middle_center);
-  M5Dial.Display.drawString("設定", CX, CY - 10);
-  
+  M5Dial.Display.drawString("OBD2", CX, CY - 10);
+
   M5Dial.Display.setFont(&fonts::lgfxJapanGothicP_12);
   M5Dial.Display.setTextColor(0x3186);
-  M5Dial.Display.drawString("WiFi: 未接続", CX, CY + 10);
-  M5Dial.Display.drawString("会社座標: 設定済", CX, CY + 26);
-  M5Dial.Display.drawString("判定距離: 100m", CX, CY + 42);
+  M5Dial.Display.drawString("未接続", CX, CY + 10);
+}
+
+void drawConfigPage() {
+  // fillScreen は削除（drawMainScreen が背景を描くため）
+  M5Dial.Display.setFont(&fonts::lgfxJapanGothicP_16);
+  M5Dial.Display.setTextColor(COL_GRAY);
+  M5Dial.Display.setTextDatum(middle_center);
+  M5Dial.Display.drawString("設定", CX, CY - 30);
+
+  M5Dial.Display.setFont(&fonts::lgfxJapanGothicP_12);
+  bool wifiOk = (WiFi.status() == WL_CONNECTED);
+  M5Dial.Display.setTextColor(wifiOk ? TFT_GREEN : TFT_RED);
+  M5Dial.Display.drawString(wifiOk ? "WiFi: 接続中" : "WiFi: 未接続", CX, CY - 10);
+
+  M5Dial.Display.setTextColor(0x3186);
+  M5Dial.Display.drawString("会社座標: 設定済", CX, CY + 8);
+  M5Dial.Display.drawString("判定距離: 100m", CX, CY + 24);
+
+  uint16_t btnColor = wifiOk ? TFT_BLUE : COL_GRAY;
+  M5Dial.Display.setTextColor(btnColor);
+  M5Dial.Display.drawString("[ボタン] S3同期", CX, CY + 44);
 }
 
 // ============================================================
@@ -846,18 +869,23 @@ void handleInput() {
   
   // ボタン押下: 画面遷移
   if (M5Dial.BtnA.wasPressed()) {
+    Serial.printf("[BTN] pressed. currentScreen=%d, selectedIndex=%d\n",
+    currentScreen, selectedIndex);
     if (currentScreen == SCREEN_MENU) {
-      if (selectedIndex == 1) {  // GPS情報
+      if (selectedIndex == 1) {        // GPS情報 → フルスクリーン遷移
         currentScreen = SCREEN_GPS;
-        drawGPSInfo();
+        needsRedraw = true;
+      } else if (selectedIndex == 4) { // 設定ページでボタン → S3同期
+        syncWithS3();
+        needsRedraw = true;            // 同期後にconfigページ再描画
       } else {
-        // 他メニューは仮フィードバック
+        // その他は仮フィードバック
         M5Dial.Display.fillCircle(CX, CY, 30, menuItems[selectedIndex].color);
         delay(100);
         needsRedraw = true;
       }
     } else {
-      // サブ画面からメニューに戻る
+      // フルスクリーン → メニューに戻る
       currentScreen = SCREEN_MENU;
       needsRedraw = true;
     }
@@ -1110,12 +1138,301 @@ void updateAddress() {
   lastAddressUpdate = millis();
 }
 
+// バイト列 → 16進文字列
+String toHexStr(const uint8_t* buf, size_t len) {
+  String result = "";
+  for (size_t i = 0; i < len; i++) {
+    char hex[3];
+    sprintf(hex, "%02x", buf[i]);
+    result += hex;
+  }
+  return result;
+}
+
+// SHA256 → 16進文字列
+String sha256Hex(const String& data) {
+  uint8_t hash[32];
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  mbedtls_sha256_starts(&ctx, 0);
+  mbedtls_sha256_update(&ctx, (const uint8_t*)data.c_str(), data.length());
+  mbedtls_sha256_finish(&ctx, hash);
+  mbedtls_sha256_free(&ctx);
+  return toHexStr(hash, 32);
+}
+
+// HMAC-SHA256
+void hmacSHA256(const uint8_t* key, size_t keyLen,
+                const uint8_t* data, size_t dataLen,
+                uint8_t* out) {
+  mbedtls_md_context_t ctx;
+  mbedtls_md_init(&ctx);
+  mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1);
+  mbedtls_md_hmac_starts(&ctx, key, keyLen);
+  mbedtls_md_hmac_update(&ctx, data, dataLen);
+  mbedtls_md_hmac_finish(&ctx, out);
+  mbedtls_md_free(&ctx);
+}
+
+// AWS Signature V4 署名キー生成
+void getSigningKey(const String& dateStamp, uint8_t* signingKey) {
+  String secretPrefix = "AWS4" + String(AWS_SECRET_ACCESS_KEY);
+  uint8_t kDate[32], kRegion[32], kService[32], kSigning[32];
+  hmacSHA256((uint8_t*)secretPrefix.c_str(), secretPrefix.length(),
+             (uint8_t*)dateStamp.c_str(), dateStamp.length(), kDate);
+  hmacSHA256(kDate, 32, (uint8_t*)AWS_REGION, strlen(AWS_REGION), kRegion);
+  hmacSHA256(kRegion, 32, (uint8_t*)"s3", 2, kService);
+  hmacSHA256(kService, 32, (uint8_t*)"aws4_request", 12, kSigning);
+  memcpy(signingKey, kSigning, 32);
+}
+
+String buildS3AuthHeader(const String& method, const String& objectKey,
+                         const String& payloadHash, const String& dateTime,
+                         const String& dateStamp, const String& contentType) {
+  String canonicalHeaders;
+  String signedHeaders;
+
+  if (contentType.length() > 0) {
+    canonicalHeaders = "content-type:" + contentType + "\n"
+                     + "host:" + String(S3_HOST) + "\n"
+                     + "x-amz-content-sha256:" + payloadHash + "\n"
+                     + "x-amz-date:" + dateTime + "\n";
+    signedHeaders = "content-type;host;x-amz-content-sha256;x-amz-date";
+  } else {
+    canonicalHeaders = "host:" + String(S3_HOST) + "\n"
+                     + "x-amz-content-sha256:" + payloadHash + "\n"
+                     + "x-amz-date:" + dateTime + "\n";
+    signedHeaders = "host;x-amz-content-sha256;x-amz-date";
+  }
+
+  String canonicalRequest = method + "\n"
+    + "/" + objectKey + "\n"
+    + "\n"
+    + canonicalHeaders + "\n"
+    + signedHeaders + "\n"
+    + payloadHash;
+
+  String credentialScope = dateStamp + "/" + AWS_REGION + "/s3/aws4_request";
+  String stringToSign = "AWS4-HMAC-SHA256\n"
+    + dateTime + "\n"
+    + credentialScope + "\n"
+    + sha256Hex(canonicalRequest);
+
+  uint8_t signingKey[32];
+  getSigningKey(dateStamp, signingKey);
+  uint8_t signatureBytes[32];
+  hmacSHA256(signingKey, 32,
+             (uint8_t*)stringToSign.c_str(), stringToSign.length(),
+             signatureBytes);
+
+  return "AWS4-HMAC-SHA256 Credential=" + String(AWS_ACCESS_KEY_ID)
+    + "/" + credentialScope
+    + ", SignedHeaders=" + signedHeaders
+    + ", Signature=" + toHexStr(signatureBytes, 32);
+}
+
+void getAwsDateTime(String& dateStamp, String& dateTime) {
+  String dt = getRTCDateTime();  // "2026-03-09 12:00:00" (JST)
+
+  // JSTをUTCに変換（-9時間）
+  int yy  = dt.substring(0, 4).toInt();
+  int mo  = dt.substring(5, 7).toInt();
+  int dd  = dt.substring(8, 10).toInt();
+  int hh  = dt.substring(11, 13).toInt();
+  int mi  = dt.substring(14, 16).toInt();
+  int ss  = dt.substring(17, 19).toInt();
+
+  hh -= 9;
+  if (hh < 0) {
+    hh += 24;
+    dd -= 1;
+    if (dd < 1) {
+      mo -= 1;
+      if (mo < 1) { mo = 12; yy -= 1; }
+      // 月末日テーブル
+      int daysInMonth[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+      if (mo == 2 && (yy % 4 == 0)) daysInMonth[1] = 29;
+      dd = daysInMonth[mo - 1];
+    }
+  }
+
+  char ds[9], dts[17];
+  sprintf(ds,  "%04d%02d%02d",          yy, mo, dd);
+  sprintf(dts, "%04d%02d%02dT%02d%02d%02dZ", yy, mo, dd, hh, mi, ss);
+  dateStamp = String(ds);
+  dateTime  = String(dts);
+}
+
+bool uploadTripsToS3() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  // --- JSON 読み込み ---
+  File f = SPIFFS.open("/trips.json", "r");
+  if (!f) {
+    Serial.println("[S3] trips.json open failed");
+    return false;
+  }
+  String payload = f.readString();
+  f.close();
+
+  if (payload.length() == 0) {
+    Serial.println("[S3] trips.json empty");
+    return false;
+  }
+
+  // --- AWS 署名用データ ---
+  String dateStamp, dateTime;
+  getAwsDateTime(dateStamp, dateTime);
+
+  String payloadHash = sha256Hex(payload);
+  String contentType = "application/json";
+  String objectKey   = "trips.json";
+
+  String authHeader = buildS3AuthHeader(
+      "PUT",
+      objectKey,
+      payloadHash,
+      dateTime,
+      dateStamp,
+      contentType
+  );
+
+  // --- Secure クライアント作成 ---
+  WiFiClientSecure client;
+  client.setInsecure();   // 初期テスト用。本番は CA 設定推奨
+
+  // --- HTTPClient 開始 ---
+  HTTPClient http;
+  String url = "https://" + String(S3_HOST) + "/" + objectKey;
+
+  if (!http.begin(client, url)) {
+    Serial.println("[S3] http.begin failed");
+    return false;
+  }
+
+  http.setTimeout(10000);
+
+  // --- 必要ヘッダー ---
+  http.addHeader("Host", S3_HOST);
+  http.addHeader("Content-Type", contentType);
+  http.addHeader("x-amz-content-sha256", payloadHash);
+  http.addHeader("x-amz-date", dateTime);
+  http.addHeader("Authorization", authHeader);
+
+  // --- PUT 実行 ---
+  int code = http.PUT(payload);
+  http.end();
+
+  if (code == 200 || code == 204) {
+    Serial.printf("[S3] PUT trips.json OK (%d)\n", code);
+    return true;
+  }
+
+  Serial.printf("[S3] PUT error: %d\n", code);
+  return false;
+}
+
+bool downloadDriversFromS3() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  // --- AWS 署名用データ ---
+  String dateStamp, dateTime;
+  getAwsDateTime(dateStamp, dateTime);
+
+  // GET は空ボディ → SHA256 は固定値
+  const String emptyHash =
+      "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+  String objectKey = "drivers.json";
+
+  String authHeader = buildS3AuthHeader(
+      "GET",
+      objectKey,
+      emptyHash,
+      dateTime,
+      dateStamp,
+      ""   // GET は Content-Type なし
+  );
+
+  // --- Secure クライアント ---
+  WiFiClientSecure client;
+  client.setInsecure();  // 初期テスト用。本番は CA 設定推奨
+
+  // --- HTTPClient 開始 ---
+  HTTPClient http;
+  String url = "https://" + String(S3_HOST) + "/" + objectKey;
+
+  if (!http.begin(client, url)) {
+    Serial.println("[S3] http.begin failed");
+    return false;
+  }
+
+  http.setTimeout(10000);
+
+  // --- 必要ヘッダー ---
+  http.addHeader("Host", S3_HOST);
+  http.addHeader("x-amz-content-sha256", emptyHash);
+  http.addHeader("x-amz-date", dateTime);
+  http.addHeader("Authorization", authHeader);
+
+  // --- GET 実行 ---
+  int code = http.GET();
+
+  if (code == 200) {
+    String body = http.getString();
+    http.end();
+
+    File f = SPIFFS.open("/drivers.json", "w");
+    if (!f) {
+      Serial.println("[S3] drivers.json write failed");
+      return false;
+    }
+
+    f.print(body);
+    f.close();
+
+    Serial.println("[S3] GET drivers.json OK");
+    return true;
+  }
+
+  String errBody = http.getString();  // エラー内容取得
+  Serial.printf("[S3] GET error: %d\n", code);
+  Serial.println("[S3] error body: " + errBody);  // XML形式でエラー詳細が出る
+  http.end();
+  return false;
+}
+
+void syncWithS3() {
+    // シークレットキーの長さと先頭4文字だけ確認（セキュリティ上これだけでOK）
+  String secret = String(AWS_SECRET_ACCESS_KEY);
+  Serial.printf("[S3] secret len=%d, first4=%s\n", 
+    secret.length(), secret.substring(0, 4).c_str());
+  Serial.printf("[S3] access key=%s\n", AWS_ACCESS_KEY_ID);
+  Serial.printf("[MEM] Free heap: %d bytes\n", ESP.getFreeHeap());
+  Serial.println("[S3] sync start...");
+  String dateStamp, dateTime;
+  getAwsDateTime(dateStamp, dateTime);
+  Serial.printf("[S3] dateStamp=%s\n", dateStamp.c_str());
+  Serial.printf("[S3] dateTime=%s\n", dateTime.c_str());
+
+  Serial.printf("[MEM] Before upload: %d bytes\n", ESP.getFreeHeap());
+  bool up   = uploadTripsToS3();
+  Serial.printf("[MEM] After upload: %d bytes\n", ESP.getFreeHeap());
+
+  bool down = downloadDriversFromS3();
+  Serial.printf("[S3] sync done: upload=%s / download=%s\n",
+    up ? "OK" : "NG", down ? "OK" : "NG");
+}
+
 // ============================================================
 // Setup
 // ============================================================
 void setup() {
+  Serial.begin(115200);
+  //while (!Serial) delay(10);  // USB CDC接続待ち（これが重要）
+  Serial.println("=== BOOT ===");
+
   M5Dial.begin(true, true);  // enableEncoder=true, enableRFID=true
-  // GPS初期化
   gpsSerial.begin(115200, SERIAL_8N1, GPS_RX, GPS_TX);
 
   // SPIFFS初期化
@@ -1193,8 +1510,14 @@ void loop() {
       lastGPSRedraw = millis();
     }
 
-    if (needsRedraw && currentScreen == SCREEN_MENU) {
-      drawMainScreen();
+    if (needsRedraw) {
+      switch (currentScreen) {
+        case SCREEN_MENU:   drawMainScreen();  break;
+        case SCREEN_GPS:    drawGPSInfo();     break;
+        case SCREEN_OBD2:   drawOBD2Page();    break;
+        case SCREEN_DRIVER: drawDriverPage();  break;
+        case SCREEN_CONFIG: drawConfigPage();  break;
+      }
       needsRedraw = false;
     }
   }

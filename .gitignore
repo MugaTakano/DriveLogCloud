@@ -15,3 +15,6 @@ desktop.ini
 *.swo
 *~
 .vscode/
+
+# 秘密情報ファイル
+secrets.h
