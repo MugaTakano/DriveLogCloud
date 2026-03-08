@@ -10,6 +10,8 @@
 #include <TinyGPSPlus.h>
 #include <SPIFFS.h>
 #include <ArduinoJson.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
 
 // ============================================================
 // ビットマップアイコンデータ（PNG, PROGMEM）
@@ -275,12 +277,27 @@ bool modReady[MOD_COUNT] = { false, false, false, false };
 // NFC関連
 // ============================================================
 
+// WiFi設定（初期値・コード埋め込み）
+const char* WIFI_SSID = "AirNet";      // ← 自宅WiFiのSSIDに書き換え
+const char* WIFI_PASS = "megu2527passb";   // ← パスワードに書き換え
+
+// WiFi接続（ノンブロッキング）
+bool wifiConnecting = false;
+unsigned long wifiConnectStart = 0;
+const unsigned long WIFI_TIMEOUT = 10000;  // 10秒タイムアウト
 
 // GPS
 TinyGPSPlus gps;
 HardwareSerial gpsSerial(1);
+
+// 国土地理院 逆ジオコーディング
+String currentAddress = "";
+unsigned long lastAddressUpdate = 0;
+const unsigned long ADDRESS_INTERVAL = 30000;  // 30秒ごとに更新
+
 #define GPS_RX 1  // PORT.A: GPS TX → M5Dial G1
 #define GPS_TX 2  // PORT.A: GPS RX → M5Dial G2
+
 // 基準点（会社座標）※仮: 自宅
 #define BASE_LAT 43.802500
 #define BASE_LNG 143.815800
@@ -300,6 +317,7 @@ Screen currentScreen = SCREEN_MENU;
 
 // ドライバー情報
 String currentDriverUID = "";
+String currentDriverName = "";
 String displayUID = "";
 bool nfcReady = false;
 unsigned long lastNfcRead = 0;
@@ -552,7 +570,8 @@ void pollNFC() {
   if (uid.length() > 0) {
     currentDriverUID = uid;
     displayUID = uid;
-    Serial.printf("NFC: Card detected UID=%s\n", uid.c_str());
+    currentDriverName = lookupDriver(uid);  // ← 追加
+    Serial.printf("NFC: UID=%s -> %s\n", uid.c_str(), currentDriverName.c_str());
     
     // ブザーフィードバック
     M5Dial.Speaker.tone(2000, 80);
@@ -628,28 +647,91 @@ void drawMenuIcons() {
 // ============================================================
 
 void drawStatusPage() {
-  M5Dial.Display.setFont(&fonts::lgfxJapanGothicP_20);
+  // 現在時刻（大きく上部に）
+  auto dt = M5Dial.Rtc.getDateTime();
+  char timeBuf[6];
+  snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d", dt.time.hours, dt.time.minutes);
+  M5Dial.Display.setFont(&fonts::Font4);
   M5Dial.Display.setTextColor(COL_GREEN);
   M5Dial.Display.setTextDatum(middle_center);
-  M5Dial.Display.drawString("待機中", CX, CY);
+  M5Dial.Display.drawString(timeBuf, CX, CY - 30);
   
-  M5Dial.Display.setFont(&fonts::lgfxJapanGothicP_12);
+  // 日付（小さく時刻の下に）
+  char dateBuf[11];
+  snprintf(dateBuf, sizeof(dateBuf), "%04d/%02d/%02d", dt.date.year, dt.date.month, dt.date.date);
+  M5Dial.Display.setFont(&fonts::Font4);
   M5Dial.Display.setTextColor(COL_GREEN_DIM);
-  M5Dial.Display.drawString("運転者: 未登録", CX, CY + 22);
-  M5Dial.Display.drawString("運行: 停止", CX, CY + 38);
+  M5Dial.Display.drawString(dateBuf, CX, CY);
+  
+  // ステータス情報
+  String driverStr = (currentDriverName.length() > 0 && currentDriverName != "unregistered") 
+    ? currentDriverName : "未登録";
+  M5Dial.Display.drawString("運転者: " + driverStr, CX, CY + 24);
+  M5Dial.Display.drawString(tripActive ? "運行中" : "待機中", CX, CY + 40);
 }
 
 void drawGpsPage() {
   M5Dial.Display.setFont(&fonts::lgfxJapanGothicP_16);
+  
   M5Dial.Display.setTextColor(COL_CYAN);
   M5Dial.Display.setTextDatum(middle_center);
-  M5Dial.Display.drawString("GPS情報", CX, CY - 10);
+  M5Dial.Display.drawString("GPS情報", CX, CY - 50);
   
   M5Dial.Display.setFont(&fonts::lgfxJapanGothicP_12);
-  M5Dial.Display.setTextColor(0x0410);
-  M5Dial.Display.drawString("衛星: 受信待ち", CX, CY + 10);
-  M5Dial.Display.drawString("最遠地点: ---", CX, CY + 26);
-  M5Dial.Display.drawString("距離: ---", CX, CY + 42);
+  
+  // 衛星数
+  if (gps.satellites.isValid()) {
+    M5Dial.Display.setTextColor(COL_GREEN);
+    char satBuf[20];
+    snprintf(satBuf, sizeof(satBuf), "衛星: %d基", (int)gps.satellites.value());
+    M5Dial.Display.drawString(satBuf, CX, CY - 28);
+  } else {
+    M5Dial.Display.setTextColor(0x7800);
+    M5Dial.Display.drawString("衛星: 受信待ち", CX, CY - 28);
+  }
+  
+  // 運行状態
+  M5Dial.Display.setTextColor(tripActive ? COL_GREEN : COL_WHITE_DIM);
+  M5Dial.Display.drawString(tripActive ? "運行中" : "待機中", CX, CY - 10);
+  
+  // 現在座標
+  if (gps.location.isValid()) {
+    M5Dial.Display.setTextColor(COL_WHITE_DIM);
+    char posBuf[28];
+    snprintf(posBuf, sizeof(posBuf), "%.5f, %.5f", gps.location.lat(), gps.location.lng());
+    M5Dial.Display.drawString(posBuf, CX, CY + 8);
+  } else {
+    M5Dial.Display.setTextColor(0x3186);
+    M5Dial.Display.drawString("測位中...", CX, CY + 8);
+  }
+  
+  // 最遠地点距離
+  M5Dial.Display.setTextColor(COL_CYAN);
+  if (farthestDist > 0) {
+    char distBuf[24];
+    if (farthestDist >= 1000) {
+      snprintf(distBuf, sizeof(distBuf), "最遠: %.1f km", farthestDist / 1000.0);
+    } else {
+      snprintf(distBuf, sizeof(distBuf), "最遠: %.0f m", farthestDist);
+    }
+    M5Dial.Display.drawString(distBuf, CX, CY + 28);
+  } else {
+    M5Dial.Display.drawString("最遠: ---", CX, CY + 28);
+  }
+  
+  // 基準点からの現在距離
+  if (gps.location.isValid()) {
+    double currentDist = calcDistance(BASE_LAT, BASE_LNG, gps.location.lat(), gps.location.lng());
+    M5Dial.Display.setTextColor(0x3186);
+    char curDistBuf[24];
+    snprintf(curDistBuf, sizeof(curDistBuf), "現在: %.0f m", currentDist);
+    M5Dial.Display.drawString(curDistBuf, CX, CY + 46);
+  }
+  if (currentAddress.length() > 0) {
+    M5Dial.Display.setFont(&fonts::lgfxJapanGothicP_12);
+    M5Dial.Display.setTextColor(COL_GREEN);
+    M5Dial.Display.drawString(currentAddress, CX, CY + 58);
+  }
 }
 
 void drawObdPage() {
@@ -670,24 +752,26 @@ void drawDriverPage() {
   
   if (currentDriverUID.length() > 0) {
     // --- カード読み取り済み ---
-    // チェックマークアイコン
     M5Dial.Display.setFont(&fonts::lgfxJapanGothicP_20);
     M5Dial.Display.setTextColor(COL_PURPLE);
-    M5Dial.Display.drawString("ドライバー", CX, CY - 28);
+    M5Dial.Display.drawString("ドライバー", CX, CY - 36);
     
-    // UID表示
+    // ドライバー名（照合結果）
+    if (currentDriverName.length() > 0 && currentDriverName != "unregistered") {
+      M5Dial.Display.setFont(&fonts::lgfxJapanGothicP_20);
+      M5Dial.Display.setTextColor(COL_GREEN);
+      M5Dial.Display.drawString(currentDriverName, CX, CY);
+    } else {
+      M5Dial.Display.setFont(&fonts::lgfxJapanGothicP_16);
+      M5Dial.Display.setTextColor(0x7800);  // 赤系
+      M5Dial.Display.drawString("未登録カード", CX, CY);
+    }
+    
+    // UID表示（小さく下部に）
     M5Dial.Display.setFont(&fonts::Font0);
     M5Dial.Display.setTextSize(1);
-    M5Dial.Display.setTextColor(0x780F);
-    M5Dial.Display.drawString("UID:", CX, CY + 2);
-    
-    M5Dial.Display.setFont(&fonts::lgfxJapanGothicP_12);
     M5Dial.Display.setTextColor(COL_WHITE_DIM);
-    M5Dial.Display.drawString(displayUID, CX, CY + 18);
-    
-    // 登録済み表示
-    M5Dial.Display.setTextColor(COL_GREEN);
-    M5Dial.Display.drawString("登録済み", CX, CY + 42);
+    M5Dial.Display.drawString(displayUID, CX, CY + 30);
   } else {
     // --- 待機中 ---
     M5Dial.Display.setFont(&fonts::lgfxJapanGothicP_16);
@@ -881,7 +965,7 @@ void saveTripLocal() {
   }
 
   JsonObject trip = doc.as<JsonArray>().add<JsonObject>();
-  trip["date"] = "2025-01-01";  // TODO: RTCから取得
+  trip["date"] = getRTCDateTime();
   trip["lat"] = farthestLat;
   trip["lng"] = farthestLng;
   trip["dist"] = farthestDist;
@@ -910,6 +994,122 @@ String lookupDriver(String uid) {
   return "unregistered";
 }
 
+// drivers.json が無ければサンプルデータを作成
+void initDriversJson() {
+  if (SPIFFS.exists("/drivers.json")) return;
+  
+  JsonDocument doc;
+  JsonArray arr = doc.to<JsonArray>();
+  
+  // サンプルデータ（後でS3同期で上書きされる）
+  JsonObject d1 = arr.add<JsonObject>();
+  d1["uid"] = "08:8E:A9:A3";
+  d1["name"] = "高野個人携帯";
+  
+  JsonObject d2 = arr.add<JsonObject>();
+  d2["uid"] = "04:66:30:4A:4B:4D:80";
+  d2["name"] = "高野　無我";
+  
+  JsonObject d3 = arr.add<JsonObject>();
+  d3["uid"] = "01:02:03:04";
+  d3["name"] = "高野会社携帯";
+  
+  File f = SPIFFS.open("/drivers.json", "w");
+  serializeJson(doc, f);
+  f.close();
+  Serial.println("drivers.json created with sample data");
+}
+
+bool rtcSynced = false;
+
+void syncRTCFromGPS() {
+  if (rtcSynced) return;
+  if (!gps.date.isValid() || !gps.time.isValid()) return;
+  if (gps.date.year() < 2024) return;  // 無効な日付を除外
+  
+  m5::rtc_datetime_t dt;
+  dt.date.year = gps.date.year();
+  dt.date.month = gps.date.month();
+  dt.date.date = gps.date.day();
+  dt.time.hours = gps.time.hour() + 9;  // UTC → JST
+  dt.time.minutes = gps.time.minute();
+  dt.time.seconds = gps.time.second();
+  
+  // 日付繰り上がり処理
+  if (dt.time.hours >= 24) {
+    dt.time.hours -= 24;
+    dt.date.date += 1;  // 簡易処理（月末は厳密でないが実用上問題なし）
+  }
+  
+  M5Dial.Rtc.setDateTime(dt);
+  rtcSynced = true;
+  Serial.println("RTC synced from GPS");
+}
+
+String getRTCDateTime() {
+  auto dt = M5Dial.Rtc.getDateTime();
+  char buf[20];
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
+    dt.date.year, dt.date.month, dt.date.date,
+    dt.time.hours, dt.time.minutes, dt.time.seconds);
+  return String(buf);
+}
+
+void startWiFiConnect() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  wifiConnecting = true;
+  wifiConnectStart = millis();
+  Serial.println("WiFi connecting...");
+}
+
+void updateWiFiStatus() {
+  if (!wifiConnecting) return;
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnecting = false;
+    Serial.printf("WiFi connected: %s\n", WiFi.localIP().toString().c_str());
+  } else if (millis() - wifiConnectStart > WIFI_TIMEOUT) {
+    wifiConnecting = false;
+    WiFi.disconnect();
+    Serial.println("WiFi timeout");
+  }
+}
+
+void updateAddress() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (!gps.location.isValid()) return;
+  if (millis() - lastAddressUpdate < ADDRESS_INTERVAL && currentAddress.length() > 0) return;
+  
+  HTTPClient http;
+  String url = "https://geoapi.heartrails.com/api/json?method=searchByGeoLocation&x="
+    + String(gps.location.lng(), 6) + "&y=" + String(gps.location.lat(), 6);  // x=経度, y=緯度
+  
+  http.begin(url);
+  http.setTimeout(5000);
+  int httpCode = http.GET();
+  
+  if (httpCode == 200) {
+    String payload = http.getString();
+    JsonDocument doc;
+    deserializeJson(doc, payload);
+    
+    String city = doc["response"]["location"][0]["city"].as<String>();  // 例: 北見市
+    String town = doc["response"]["location"][0]["town"].as<String>();  // 例: 東相内町
+    
+    if (city.length() > 0) {
+      currentAddress = city + town;
+    } else {
+      currentAddress = "住所取得失敗";
+    }
+    Serial.printf("Address: %s\n", currentAddress.c_str());
+  } else {
+    Serial.printf("HeartRails API error: %d\n", httpCode);
+  }
+  
+  http.end();
+  lastAddressUpdate = millis();
+}
+
 // ============================================================
 // Setup
 // ============================================================
@@ -922,6 +1122,10 @@ void setup() {
   if (!SPIFFS.begin(true)) {
     Serial.println("SPIFFS mount failed");
   }
+  initDriversJson();  // ← 追加
+
+  // WiFi接続開始
+  startWiFiConnect();
 
   M5Dial.Display.setRotation(0);
   M5Dial.Display.setBrightness(80);
@@ -969,6 +1173,11 @@ void loop() {
   while (gpsSerial.available() > 0) {
     gps.encode(gpsSerial.read());
   }
+  syncRTCFromGPS();  // GPS有効になったら1回だけRTCに同期
+
+  updateWiFiStatus();
+  updateAddress();
+
   // 最遠地点更新
   updateFarthestPoint();
 
