@@ -1,0 +1,955 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Drive Log Cloud — 管理画面</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;600&family=Noto+Sans+JP:wght@300;400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg:        #0d0f12;
+    --surface:   #141720;
+    --border:    #1f2535;
+    --accent:    #00e5a0;
+    --accent2:   #0077ff;
+    --warn:      #ff6b35;
+    --text:      #c8d0e0;
+    --text-dim:  #5a6480;
+    --text-head: #e8edf5;
+    --mono:      'JetBrains Mono', monospace;
+    --sans:      'Noto Sans JP', sans-serif;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 14px;
+    min-height: 100vh;
+  }
+
+  /* ── HEADER ── */
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 28px;
+    height: 56px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+
+  .logo {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .logo-mark {
+    width: 28px; height: 28px;
+    border: 2px solid var(--accent);
+    border-radius: 6px;
+    display: flex; align-items: center; justify-content: center;
+    position: relative;
+  }
+
+  .logo-mark::after {
+    content: '';
+    width: 8px; height: 8px;
+    background: var(--accent);
+    border-radius: 50%;
+    animation: pulse 2s ease-in-out infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50%       { opacity: 0.4; transform: scale(0.7); }
+  }
+
+  .logo-text {
+    font-family: var(--mono);
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-head);
+    letter-spacing: 0.05em;
+  }
+
+  .logo-text span { color: var(--accent); }
+
+  .header-right {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+
+  .status-badge {
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 3px 10px;
+    border-radius: 20px;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+  }
+
+  .status-badge.ok   { border-color: var(--accent); color: var(--accent); }
+  .status-badge.err  { border-color: var(--warn);   color: var(--warn);   }
+
+  .btn-reload {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 5px 14px;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.15s;
+    letter-spacing: 0.05em;
+  }
+
+  .btn-reload:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  /* ── TABS ── */
+  .tabs {
+    display: flex;
+    gap: 0;
+    border-bottom: 1px solid var(--border);
+    padding: 0 28px;
+    background: var(--surface);
+  }
+
+  .tab {
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 12px 20px;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    color: var(--text-dim);
+    letter-spacing: 0.06em;
+    transition: all 0.15s;
+    user-select: none;
+  }
+
+  .tab:hover  { color: var(--text); }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+  /* ── LAYOUT ── */
+  .content {
+    padding: 24px 28px;
+    max-width: 1400px;
+  }
+
+  .panel { display: none; }
+  .panel.active { display: block; }
+
+  /* ── STATS BAR ── */
+  .stats-bar {
+    display: flex;
+    gap: 16px;
+    margin-bottom: 20px;
+  }
+
+  .stat-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 20px;
+    min-width: 140px;
+  }
+
+  .stat-label {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text-dim);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    margin-bottom: 6px;
+  }
+
+  .stat-value {
+    font-family: var(--mono);
+    font-size: 22px;
+    font-weight: 600;
+    color: var(--text-head);
+  }
+
+  .stat-value span {
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-left: 4px;
+  }
+
+  /* ── TOOLBAR ── */
+  .toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 12px;
+    gap: 12px;
+  }
+
+  .toolbar-left { display: flex; gap: 10px; align-items: center; }
+
+  input[type="text"], input[type="date"] {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 7px 12px;
+    border-radius: 4px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+
+  input[type="text"]:focus, input[type="date"]:focus {
+    border-color: var(--accent);
+  }
+
+  input[type="text"]::placeholder { color: var(--text-dim); }
+
+  .btn {
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 7px 16px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    cursor: pointer;
+    letter-spacing: 0.06em;
+    transition: all 0.15s;
+    background: transparent;
+    color: var(--text-dim);
+  }
+
+  .btn:hover        { border-color: var(--text-dim); color: var(--text); }
+  .btn.btn-accent   { border-color: var(--accent); color: var(--accent); }
+  .btn.btn-accent:hover { background: var(--accent); color: var(--bg); }
+  .btn.btn-warn     { border-color: var(--warn); color: var(--warn); }
+
+  /* ── TABLE ── */
+  .table-wrap {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: auto;
+    max-height: calc(100vh - 280px);
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+
+  thead {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    background: #0f1118;
+  }
+
+  th {
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    padding: 12px 16px;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+
+  th.sortable { cursor: pointer; user-select: none; }
+  th.sortable:hover { color: var(--text); }
+  th.sort-asc::after  { content: ' ↑'; color: var(--accent); }
+  th.sort-desc::after { content: ' ↓'; color: var(--accent); }
+
+  td {
+    padding: 11px 16px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: middle;
+    white-space: nowrap;
+  }
+
+  tr:last-child td { border-bottom: none; }
+
+  tbody tr { transition: background 0.1s; }
+  tbody tr:hover { background: rgba(255,255,255,0.025); }
+
+  .td-date    { font-family: var(--mono); font-size: 12px; color: var(--text-head); font-weight: 500; }
+  .td-driver  { font-weight: 500; color: var(--text-head); }
+  .td-uid     { font-family: var(--mono); font-size: 11px; color: var(--text-dim); }
+  .td-address { color: var(--text); }
+  .td-dist    { font-family: var(--mono); font-size: 12px; color: var(--accent); text-align: right; }
+  .td-coords  { font-family: var(--mono); font-size: 11px; color: var(--text-dim); }
+
+  .no-data {
+    text-align: center;
+    padding: 60px;
+    color: var(--text-dim);
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.05em;
+  }
+
+  /* ── DRIVERS PANEL ── */
+  .driver-grid {
+    display: grid;
+    grid-template-columns: 1fr 340px;
+    gap: 20px;
+    align-items: start;
+  }
+
+  .driver-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+
+  .driver-card-header {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-dim);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .driver-row {
+    display: flex;
+    align-items: center;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    gap: 14px;
+    transition: background 0.1s;
+  }
+
+  .driver-row:last-child { border-bottom: none; }
+  .driver-row:hover { background: rgba(255,255,255,0.025); }
+
+  .driver-avatar {
+    width: 36px; height: 36px;
+    border-radius: 8px;
+    background: var(--border);
+    border: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: center;
+    font-family: var(--mono);
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--accent);
+    flex-shrink: 0;
+  }
+
+  .driver-info { flex: 1; min-width: 0; }
+
+  .driver-name {
+    font-weight: 500;
+    color: var(--text-head);
+    margin-bottom: 2px;
+  }
+
+  .driver-uid-text {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .driver-action {
+    display: flex;
+    gap: 6px;
+  }
+
+  .icon-btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    width: 28px; height: 28px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 13px;
+    display: flex; align-items: center; justify-content: center;
+    transition: all 0.15s;
+  }
+
+  .icon-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .icon-btn.del:hover { border-color: var(--warn); color: var(--warn); }
+
+  /* ── EDITOR PANEL ── */
+  .editor-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    position: sticky;
+    top: 80px;
+  }
+
+  .editor-header {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-dim);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .editor-body { padding: 16px; }
+
+  .form-group { margin-bottom: 14px; }
+
+  .form-label {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text-dim);
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    display: block;
+    margin-bottom: 6px;
+  }
+
+  .form-input {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 8px 12px;
+    border-radius: 4px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+
+  .form-input:focus { border-color: var(--accent); }
+
+  .editor-actions {
+    display: flex;
+    gap: 8px;
+    padding: 12px 16px;
+    border-top: 1px solid var(--border);
+  }
+
+  .btn-full { flex: 1; text-align: center; }
+
+  /* ── DOWNLOAD NOTICE ── */
+  .download-notice {
+    background: rgba(0, 119, 255, 0.08);
+    border: 1px solid rgba(0, 119, 255, 0.3);
+    border-radius: 6px;
+    padding: 10px 14px;
+    margin: 12px 16px;
+    font-size: 12px;
+    color: #6ab0ff;
+    display: none;
+    line-height: 1.5;
+  }
+
+  /* ── LOADING ── */
+  .loading-overlay {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 60px;
+    gap: 10px;
+    color: var(--text-dim);
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+
+  .spinner {
+    width: 16px; height: 16px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+  }
+
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── SCROLLBAR ── */
+  ::-webkit-scrollbar { width: 5px; height: 5px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 10px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
+
+  /* ── TOAST ── */
+  #toast {
+    position: fixed;
+    bottom: 24px; right: 24px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 18px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text);
+    transform: translateY(80px);
+    opacity: 0;
+    transition: all 0.25s;
+    z-index: 999;
+    pointer-events: none;
+  }
+
+  #toast.show { transform: translateY(0); opacity: 1; }
+  #toast.accent { border-color: var(--accent); color: var(--accent); }
+  #toast.warn   { border-color: var(--warn);   color: var(--warn);   }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-mark"></div>
+    <div class="logo-text">Drive Log <span>Cloud</span></div>
+  </div>
+  <div class="header-right">
+    <span class="status-badge" id="status-badge">loading...</span>
+    <span id="last-updated" style="font-family:var(--mono);font-size:11px;color:var(--text-dim);letter-spacing:0.05em"></span>
+    <button class="btn-reload" onclick="loadAll()">↻ 再読込</button>
+  </div>
+</header>
+
+<div class="tabs">
+  <div class="tab active" onclick="switchTab('trips', this)">運行記録</div>
+  <div class="tab" onclick="switchTab('drivers', this)">ドライバー</div>
+</div>
+
+<div class="content">
+
+  <!-- ── TRIPS PANEL ── -->
+  <div class="panel active" id="panel-trips">
+    <div class="stats-bar" id="stats-bar">
+      <div class="stat-card">
+        <div class="stat-label">総運行件数</div>
+        <div class="stat-value" id="stat-total">—</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">総走行距離</div>
+        <div class="stat-value" id="stat-dist">—<span>km</span></div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">ドライバー数</div>
+        <div class="stat-value" id="stat-drivers">—</div>
+      </div>
+    </div>
+
+    <div class="toolbar">
+      <div class="toolbar-left">
+        <input type="text" id="search-input" placeholder="ドライバー名 / 住所で検索..." style="width:240px" oninput="renderTrips()">
+        <input type="date" id="filter-from" onchange="renderTrips()">
+        <span style="color:var(--text-dim); font-size:12px;">〜</span>
+        <input type="date" id="filter-to" onchange="renderTrips()">
+      </div>
+      <button class="btn btn-accent" onclick="exportCSV()">CSV エクスポート</button>
+    </div>
+
+    <div class="table-wrap">
+      <div class="loading-overlay" id="trips-loading"><div class="spinner"></div> データ取得中...</div>
+      <table id="trips-table" style="display:none">
+        <thead>
+          <tr>
+            <th class="sortable" onclick="sortTrips('date')">日付</th>
+            <th>UID</th>
+            <th>ドライバー</th>
+            <th>目的地（最遠地点）</th>
+            <th>GPS座標</th>
+            <th class="sortable" onclick="sortTrips('dist')" style="text-align:right">走行距離</th>
+          </tr>
+        </thead>
+        <tbody id="trips-body"></tbody>
+      </table>
+      <div class="no-data" id="trips-empty" style="display:none">運行記録がありません</div>
+    </div>
+  </div>
+
+  <!-- ── DRIVERS PANEL ── -->
+  <div class="panel" id="panel-drivers">
+    <div class="driver-grid">
+      <div>
+        <div class="toolbar" style="margin-bottom:12px">
+          <span style="font-family:var(--mono);font-size:11px;color:var(--text-dim);letter-spacing:0.08em">DRIVER LIST</span>
+          <button class="btn btn-accent" onclick="startAdd()">＋ 追加</button>
+        </div>
+        <div class="driver-card">
+          <div class="driver-card-header">登録ドライバー</div>
+          <div id="drivers-loading" class="loading-overlay"><div class="spinner"></div> 読み込み中...</div>
+          <div id="drivers-list"></div>
+          <div class="no-data" id="drivers-empty" style="display:none">ドライバーが登録されていません</div>
+        </div>
+      </div>
+
+      <div>
+        <div class="editor-card" id="editor-card" style="display:none">
+          <div class="editor-header" id="editor-title">ドライバー編集</div>
+          <div class="editor-body">
+            <input type="hidden" id="edit-index">
+            <div class="form-group">
+              <label class="form-label">ドライバー名</label>
+              <input type="text" class="form-input" id="edit-name" placeholder="例: 山田 太郎">
+            </div>
+            <div class="form-group">
+              <label class="form-label">NFC カード UID</label>
+              <input type="text" class="form-input" id="edit-uid" placeholder="例: AA:BB:CC:DD:EE:FF">
+            </div>
+          </div>
+          <div class="download-notice" id="download-notice">
+            ✔ drivers.json を更新しました。<br>
+            ダウンロードして S3 の <code>drivers.json</code> を上書きしてください。
+          </div>
+          <div class="editor-actions">
+            <button class="btn btn-accent btn-full" onclick="saveDriver()">保存</button>
+            <button class="btn btn-full" onclick="closeEditor()">キャンセル</button>
+          </div>
+        </div>
+
+        <div class="editor-card" id="export-card" style="margin-top:16px">
+          <div class="editor-header">drivers.json 操作</div>
+          <div class="editor-body">
+            <p style="font-size:12px;color:var(--text-dim);line-height:1.7;margin-bottom:14px">
+              ドライバー情報を編集後、JSONをダウンロードしてS3に手動アップロードしてください。
+            </p>
+            <button class="btn btn-accent btn-full" onclick="downloadDriversJson()" style="width:100%;text-align:center;display:block">drivers.json ダウンロード</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<div id="toast"></div>
+
+<script>
+// ──────────────────────────────────────
+// CONFIG
+// ──────────────────────────────────────
+const S3_BASE = 'https://dshomqga50xmk.cloudfront.net';
+const TRIPS_URL   = `${S3_BASE}/trips.json`;
+const DRIVERS_URL = `${S3_BASE}/drivers.json`;
+
+// ──────────────────────────────────────
+// STATE
+// ──────────────────────────────────────
+let tripsData   = [];
+let driversData = [];
+let sortKey     = 'date';
+let sortDir     = -1; // -1: desc, 1: asc
+let filteredTrips  = [];
+
+// ──────────────────────────────────────
+// INIT
+// ──────────────────────────────────────
+async function loadAll() {
+  setStatus('loading...');
+  await Promise.all([loadTrips(), loadDrivers()]);
+}
+
+async function loadTrips() {
+  document.getElementById('trips-loading').style.display = 'flex';
+  document.getElementById('trips-table').style.display  = 'none';
+  document.getElementById('trips-empty').style.display  = 'none';
+
+  try {
+    const r = await fetch(TRIPS_URL + '?t=' + Date.now());
+    if (!r.ok) throw new Error(r.status);
+    const data = await r.json();
+    tripsData = Array.isArray(data) ? data : [];
+    renderTrips();
+    setStatus('ok');
+  } catch (e) {
+    tripsData = [];
+    document.getElementById('trips-loading').style.display = 'none';
+    document.getElementById('trips-empty').style.display   = 'block';
+    document.getElementById('trips-empty').textContent     = `読み込みエラー: ${e.message}`;
+    setStatus('error', true);
+  }
+}
+
+async function loadDrivers() {
+  document.getElementById('drivers-loading').style.display = 'flex';
+  document.getElementById('drivers-list').innerHTML        = '';
+  document.getElementById('drivers-empty').style.display   = 'none';
+
+  try {
+    const r = await fetch(DRIVERS_URL + '?t=' + Date.now());
+    if (!r.ok) throw new Error(r.status);
+    const data = await r.json();
+    driversData = Array.isArray(data) ? data : [];
+    renderDrivers();
+  } catch (e) {
+    driversData = [];
+    document.getElementById('drivers-loading').style.display = 'none';
+    document.getElementById('drivers-empty').style.display   = 'block';
+  }
+}
+
+// ──────────────────────────────────────
+// TRIPS RENDER
+// ──────────────────────────────────────
+function renderTrips() {
+  const search   = document.getElementById('search-input').value.toLowerCase();
+  const fromVal  = document.getElementById('filter-from').value;
+  const toVal    = document.getElementById('filter-to').value;
+
+  let filtered = tripsData.filter(t => {
+    const matchText = !search ||
+      (t.driver_name || '').toLowerCase().includes(search) ||
+      (t.address     || '').toLowerCase().includes(search) ||
+      (t.driver_uid  || '').toLowerCase().includes(search);
+
+    const matchFrom = !fromVal || (t.date || '') >= fromVal;
+    const matchTo   = !toVal   || (t.date || '') <= toVal;
+
+    return matchText && matchFrom && matchTo;
+  });
+
+  filteredTrips = filtered;
+  updateStats(filtered);
+
+  // Sort
+  filtered.sort((a, b) => {
+    let va = a[sortKey] ?? '';
+    let vb = b[sortKey] ?? '';
+    if (sortKey === 'dist') { va = +va; vb = +vb; }
+    return va < vb ? -sortDir : va > vb ? sortDir : 0;
+  });
+
+  document.getElementById('trips-loading').style.display = 'none';
+
+  const tbody = document.getElementById('trips-body');
+  if (filtered.length === 0) {
+    document.getElementById('trips-table').style.display = 'none';
+    document.getElementById('trips-empty').style.display = 'block';
+    document.getElementById('trips-empty').textContent   = tripsData.length === 0
+      ? '運行記録がありません' : '条件に一致する記録がありません';
+    return;
+  }
+
+  document.getElementById('trips-table').style.display = '';
+  document.getElementById('trips-empty').style.display = 'none';
+
+  tbody.innerHTML = filtered.map(t => {
+    const distKm  = t.dist != null ? (t.dist / 1000).toFixed(1) : '—';
+    const lat     = t.lat  != null ? (+t.lat).toFixed(5)         : '—';
+    const lng     = t.lng  != null ? (+t.lng).toFixed(5)         : '—';
+    const name    = t.driver_name || '<span style="color:var(--text-dim)">未登録</span>';
+    const uid     = t.driver_uid  || t.driver || '—';
+    const addr    = t.address     || '—';
+
+    return `<tr>
+      <td class="td-date">${t.date || '—'}</td>
+      <td class="td-uid">${uid}</td>
+      <td class="td-driver">${name}</td>
+      <td class="td-address">${addr}</td>
+      <td class="td-coords">${lat}, ${lng}</td>
+      <td class="td-dist">${distKm}<span style="font-size:10px;color:var(--text-dim);margin-left:2px">km</span></td>
+    </tr>`;
+  }).join('');
+}
+
+function sortTrips(key) {
+  if (sortKey === key) { sortDir *= -1; }
+  else { sortKey = key; sortDir = -1; }
+
+  document.querySelectorAll('th.sortable').forEach(th => {
+    th.classList.remove('sort-asc', 'sort-desc');
+  });
+  const ths = document.querySelectorAll('th.sortable');
+  ths.forEach(th => {
+    if ((key === 'date' && th.textContent.includes('日付')) ||
+        (key === 'dist' && th.textContent.includes('走行距離'))) {
+      th.classList.add(sortDir === 1 ? 'sort-asc' : 'sort-desc');
+    }
+  });
+  renderTrips();
+}
+
+// ──────────────────────────────────────
+// STATS
+// ──────────────────────────────────────
+function updateStats(data) {
+  document.getElementById('stat-total').textContent = data.length;
+
+  const totalDist = data.reduce((s, t) => s + (t.dist || 0), 0);
+  document.getElementById('stat-dist').innerHTML =
+    (totalDist / 1000).toFixed(1) + '<span>km</span>';
+
+  const uids = new Set(data.map(t => t.driver_uid || t.driver).filter(Boolean));
+  document.getElementById('stat-drivers').textContent = uids.size;
+
+  const now = new Date();
+  const timeStr = `${now.getHours()}:${String(now.getMinutes()).padStart(2,'0')}:${String(now.getSeconds()).padStart(2,'0')}`;
+  document.getElementById('last-updated').textContent = `SYNCED ${timeStr}`;
+
+}
+
+// ──────────────────────────────────────
+// CSV EXPORT
+// ──────────────────────────────────────
+function exportCSV() {
+  if (filteredTrips.length === 0) { toast('データがありません', 'warn'); return; }
+
+  const header = ['日付', 'UID', 'ドライバー名', '目的地', '緯度', '経度', '走行距離(km)'];
+  const rows = filteredTrips.map(t => [
+    t.date        || '',
+    t.driver_uid  || t.driver || '',
+    t.driver_name || '',
+    t.address     || '',
+    t.lat         != null ? (+t.lat).toFixed(6) : '',
+    t.lng         != null ? (+t.lng).toFixed(6) : '',
+    t.dist        != null ? (t.dist / 1000).toFixed(1) : '',
+  ]);
+  const csv = [header, ...rows]
+    .map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(','))
+    .join('\r\n');
+
+  const bom  = '\uFEFF';
+  const blob = new Blob([bom + csv], { type: 'text/csv;charset=utf-8;' });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  const date = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  a.href = url; a.download = `drive_log_${date}.csv`; a.click();
+  URL.revokeObjectURL(url);
+  toast('CSVをダウンロードしました', 'accent');
+}
+
+// ──────────────────────────────────────
+// DRIVERS RENDER
+// ──────────────────────────────────────
+function renderDrivers() {
+  document.getElementById('drivers-loading').style.display = 'none';
+
+  if (driversData.length === 0) {
+    document.getElementById('drivers-empty').style.display = 'block';
+    document.getElementById('drivers-list').innerHTML = '';
+    return;
+  }
+
+  document.getElementById('drivers-empty').style.display = 'none';
+  document.getElementById('drivers-list').innerHTML = driversData.map((d, i) => {
+    const initial = (d.name || '?').charAt(0);
+    return `<div class="driver-row">
+      <div class="driver-avatar">${initial}</div>
+      <div class="driver-info">
+        <div class="driver-name">${d.name || '(名前なし)'}</div>
+        <div class="driver-uid-text">${d.uid || '—'}</div>
+      </div>
+      <div class="driver-action">
+        <button class="icon-btn" onclick="startEdit(${i})" title="編集">✎</button>
+        <button class="icon-btn del" onclick="deleteDriver(${i})" title="削除">✕</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// ──────────────────────────────────────
+// DRIVER EDITOR
+// ──────────────────────────────────────
+function startAdd() {
+  document.getElementById('edit-index').value = -1;
+  document.getElementById('edit-name').value  = '';
+  document.getElementById('edit-uid').value   = '';
+  document.getElementById('editor-title').textContent  = 'ドライバー追加';
+  document.getElementById('download-notice').style.display = 'none';
+  document.getElementById('editor-card').style.display = 'block';
+  document.getElementById('edit-name').focus();
+}
+
+function startEdit(i) {
+  const d = driversData[i];
+  document.getElementById('edit-index').value = i;
+  document.getElementById('edit-name').value  = d.name || '';
+  document.getElementById('edit-uid').value   = d.uid  || '';
+  document.getElementById('editor-title').textContent  = 'ドライバー編集';
+  document.getElementById('download-notice').style.display = 'none';
+  document.getElementById('editor-card').style.display = 'block';
+  document.getElementById('edit-name').focus();
+}
+
+function closeEditor() {
+  document.getElementById('editor-card').style.display = 'none';
+}
+
+function saveDriver() {
+  const name = document.getElementById('edit-name').value.trim();
+  const uid  = document.getElementById('edit-uid').value.trim().toUpperCase();
+  const idx  = parseInt(document.getElementById('edit-index').value);
+
+  if (!name || !uid) { toast('名前とUIDを入力してください', 'warn'); return; }
+
+  if (idx === -1) {
+    driversData.push({ uid, name });
+  } else {
+    driversData[idx] = { uid, name };
+  }
+
+  renderDrivers();
+  document.getElementById('download-notice').style.display = 'block';
+  toast('保存しました（JSONのダウンロードをお忘れなく）', 'accent');
+}
+
+function deleteDriver(i) {
+  if (!confirm(`「${driversData[i].name}」を削除しますか？`)) return;
+  driversData.splice(i, 1);
+  renderDrivers();
+  document.getElementById('download-notice').style.display = 'block';
+  toast('削除しました（JSONのダウンロードをお忘れなく）', 'warn');
+}
+
+function downloadDriversJson() {
+  const json = JSON.stringify(driversData, null, 2);
+  const blob = new Blob([json], { type: 'application/json' });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href = url; a.download = 'drivers.json'; a.click();
+  URL.revokeObjectURL(url);
+  toast('drivers.json をダウンロードしました', 'accent');
+}
+
+// ──────────────────────────────────────
+// UI HELPERS
+// ──────────────────────────────────────
+function switchTab(name, el) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  el.classList.add('active');
+  document.getElementById('panel-' + name).classList.add('active');
+}
+
+function setStatus(text, isErr = false) {
+  const el = document.getElementById('status-badge');
+  el.textContent = text;
+  el.className   = 'status-badge' + (text === 'ok' ? ' ok' : isErr ? ' err' : '');
+}
+
+let toastTimer;
+function toast(msg, type = '') {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className   = 'show' + (type ? ' ' + type : '');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.className = ''; }, 3000);
+}
+
+// ──────────────────────────────────────
+// START
+// ──────────────────────────────────────
+loadAll();
+</script>
+</body>
+</html>

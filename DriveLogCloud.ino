@@ -978,11 +978,9 @@ void updateFarthestPoint() {
   }
 }
 
-// 運行記録をローカル保存
 void saveTripLocal() {
   JsonDocument doc;
   
-  // 既存データ読み込み
   File f = SPIFFS.open("/trips.json", "r");
   if (f) {
     deserializeJson(doc, f);
@@ -993,12 +991,14 @@ void saveTripLocal() {
   }
 
   JsonObject trip = doc.as<JsonArray>().add<JsonObject>();
-  trip["date"] = getRTCDateTime();
-  trip["lat"] = farthestLat;
-  trip["lng"] = farthestLng;
-  trip["dist"] = farthestDist;
-  trip["driver"] = currentDriverUID;
-  
+  trip["date"]        = getRTCDateTime();
+  trip["driver_uid"]  = currentDriverUID;          // "driver" から変更
+  trip["driver_name"] = lookupDriver(currentDriverUID); // 新規追加
+  trip["address"] = getAddressAt(farthestLat, farthestLng);
+  trip["dist"]        = farthestDist;
+  trip["lat"]         = farthestLat;
+  trip["lng"]         = farthestLng;
+
   File out = SPIFFS.open("/trips.json", "w");
   serializeJson(doc, out);
   out.close();
@@ -1101,6 +1101,31 @@ void updateWiFiStatus() {
     WiFi.disconnect();
     Serial.println("WiFi timeout");
   }
+}
+
+String getAddressAt(double lat, double lng) {
+  if (WiFi.status() != WL_CONNECTED) return "住所取得失敗";
+  
+  HTTPClient http;
+  String url = "https://geoapi.heartrails.com/api/json?method=searchByGeoLocation&x="
+    + String(lng, 6) + "&y=" + String(lat, 6);
+  
+  http.begin(url);
+  http.setTimeout(5000);
+  int httpCode = http.GET();
+  String result = "住所取得失敗";
+  
+  if (httpCode == 200) {
+    String payload = http.getString();
+    JsonDocument doc;
+    deserializeJson(doc, payload);
+    String city = doc["response"]["location"][0]["city"].as<String>();
+    String town = doc["response"]["location"][0]["town"].as<String>();
+    if (city.length() > 0) result = city + town;
+  }
+  
+  http.end();
+  return result;
 }
 
 void updateAddress() {
@@ -1439,6 +1464,7 @@ void setup() {
   if (!SPIFFS.begin(true)) {
     Serial.println("SPIFFS mount failed");
   }
+  //SPIFFS.remove("/trips.json");
   initDriversJson();  // ← 追加
 
   // WiFi接続開始
