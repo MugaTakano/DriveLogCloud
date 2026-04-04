@@ -15,10 +15,13 @@
 #include <HTTPClient.h>
 #include <mbedtls/md.h>
 #include <mbedtls/sha256.h>
+#include <WebServer.h>
+#include <DNSServer.h>
 #include "secrets.h"  // gitignore対象
 
 #define AWS_REGION            "us-east-1"
 #define S3_HOST               "drive-log-cloud.s3.us-east-1.amazonaws.com"
+#define AP_PASSWORD "16001600"   // 8文字以上必須（リリース時に変更）
 // ============================================================
 // ビットマップアイコンデータ（PNG, PROGMEM）
 // ============================================================
@@ -287,6 +290,19 @@ bool modReady[MOD_COUNT] = { false, false, false, false };
 bool wifiConnecting = false;
 unsigned long wifiConnectStart = 0;
 const unsigned long WIFI_TIMEOUT = 10000;  // 10秒タイムアウト
+// WiFi設定（SPIFFSから読み込み、なければsecrets.hにフォールバック）
+String wifiSSID = WIFI_SSID;
+String wifiPass = WIFI_PASS;
+int configSelectedIndex = 0;
+const int CONFIG_ITEMS = 3;
+
+// APモード
+//WebServer apServer(80);
+//WiFiServer apTcpServer(80);
+WiFiServer apTcpServer(8080);
+bool apModeActive = false;
+const char* AP_SSID = "DLC-Setup";
+DNSServer dnsServer;
 
 // GPS
 TinyGPSPlus gps;
@@ -313,9 +329,21 @@ double farthestDist = 0.0;
 // 運行状態
 bool tripActive = false;
 
+unsigned long tripCooldownUntil = 0;
+unsigned long tripStartTime = 0;
+
+float tripDistAccum = 0.0;   // 積算走行距離(km)
+double prevLat = 0.0;
+double prevLng = 0.0;
+bool prevPosValid = false;
+
+uint32_t manualDistKm = 0;  // 手動入力中の距離値
+
 // 画面状態
-enum Screen { SCREEN_MENU, SCREEN_GPS, SCREEN_OBD2, SCREEN_DRIVER, SCREEN_CONFIG };
+enum Screen { SCREEN_MENU, SCREEN_GPS, SCREEN_OBD2, SCREEN_DRIVER, SCREEN_CONFIG, SCREEN_MANUAL_DIST };
 Screen currentScreen = SCREEN_MENU;
+
+unsigned long apModeStartTime = 0;
 
 // ドライバー情報
 String currentDriverUID = "";
@@ -352,6 +380,8 @@ static const MenuItem menuItems[MENU_COUNT] = {
 // アイコン配置角度: 10, 11, 12, 1, 2 時の位置
 static const float iconAngles[MENU_COUNT] = { -150.0, -120.0, -90.0, -60.0, -30.0 };
 static const int ICON_ORBIT_R = 82;
+
+uint32_t tripStartOdometer = 0;  // 運行開始時オドメーター(km)
 
 // ============================================================
 // アプリケーション状態
@@ -809,30 +839,71 @@ void drawOBD2Page() {
 }
 
 void drawConfigPage() {
-  // fillScreen は削除（drawMainScreen が背景を描くため）
   M5Dial.Display.setFont(&fonts::lgfxJapanGothicP_16);
   M5Dial.Display.setTextColor(COL_GRAY);
   M5Dial.Display.setTextDatum(middle_center);
-  M5Dial.Display.drawString("設定", CX, CY - 30);
+  M5Dial.Display.drawString("設定", CX, CY - 42);
 
   M5Dial.Display.setFont(&fonts::lgfxJapanGothicP_12);
   bool wifiOk = (WiFi.status() == WL_CONNECTED);
   M5Dial.Display.setTextColor(wifiOk ? TFT_GREEN : TFT_RED);
-  M5Dial.Display.drawString(wifiOk ? "WiFi: 接続中" : "WiFi: 未接続", CX, CY - 10);
+  M5Dial.Display.drawString(wifiOk ? "WiFi: 接続中" : "WiFi: 未接続", CX, CY - 22);
 
-  M5Dial.Display.setTextColor(0x3186);
-  M5Dial.Display.drawString("会社座標: 設定済", CX, CY + 8);
-  M5Dial.Display.drawString("判定距離: 100m", CX, CY + 24);
+  // S3同期（選択中は白、非選択はグレー）
+  M5Dial.Display.setTextColor(configSelectedIndex == 0 ? TFT_WHITE : 0x3186);
+  M5Dial.Display.drawString("S3同期", CX, CY + 2);
 
-  uint16_t btnColor = wifiOk ? TFT_BLUE : COL_GRAY;
-  M5Dial.Display.setTextColor(btnColor);
-  M5Dial.Display.drawString("[ボタン] S3同期", CX, CY + 44);
+  // WiFi設定
+  M5Dial.Display.setTextColor(configSelectedIndex == 1 ? TFT_WHITE : 0x3186);
+  M5Dial.Display.drawString("WiFi設定", CX, CY + 22);
+
+  // デバッグ: 手動入力テスト ← 追加
+  M5Dial.Display.setTextColor(configSelectedIndex == 2 ? TFT_WHITE : 0x3186);
+  M5Dial.Display.drawString("[DBG]手動入力", CX, CY + 42);
+
+  // 選択インジケーター（テキストの左横に小さい丸）
+  // 選択インジケーター：両方を一旦黒で消してから選択中だけ白で描く
+  M5Dial.Display.fillCircle(CX - 45, CY + 2,  3, BLACK);
+  M5Dial.Display.fillCircle(CX - 45, CY + 22, 3, BLACK);
+  M5Dial.Display.fillCircle(CX - 45, CY + 42, 3, BLACK);
+  int indicatorY = (configSelectedIndex == 0) ? CY + 2 :
+                 (configSelectedIndex == 1) ? CY + 22 : CY + 42;
+  M5Dial.Display.fillCircle(CX - 45, indicatorY, 3, TFT_WHITE);
+
+  M5Dial.Display.setFont(&fonts::Font2);
+  M5Dial.Display.setTextColor(TFT_DARKGREY);
+  M5Dial.Display.drawString("long press: back", CX, CY + 62);
 }
 
 // ============================================================
 // 入力処理
 // ============================================================
 void handleInput() {
+
+  if (currentScreen == SCREEN_MANUAL_DIST) {
+    // エンコーダで±1km
+    auto enc = M5Dial.Encoder.read();
+    M5Dial.Encoder.write(0);
+    if (enc >= 2) {
+      manualDistKm++;
+      drawManualDistInput();
+    } else if (enc <= -2) {
+      if (manualDistKm > 0) manualDistKm--;
+      drawManualDistInput();
+    }
+
+    // 短押しで確定
+    if (M5Dial.BtnA.wasPressed()) {
+      lastEncoderPos = M5Dial.Encoder.read();
+      Serial.printf("[Trip] 手動入力確定: %u km\n", manualDistKm);
+      saveTripLocal(manualDistKm);
+      resetTrip();
+      currentScreen = SCREEN_MENU;
+      needsRedraw = true;
+    }
+    return;
+  }
+
   auto t = M5Dial.Touch.getDetail();
   
   // タッチ: 左半分=前、右半分=次
@@ -854,38 +925,62 @@ void handleInput() {
   long newPos = M5Dial.Encoder.read();
   long diff = newPos - lastEncoderPos;
   if (diff >= 2) {
-    if (selectedIndex < MENU_COUNT - 1) {
+    if (currentScreen == SCREEN_CONFIG) {
+      configSelectedIndex = (configSelectedIndex + 1) % CONFIG_ITEMS;
+      needsRedraw = true;
+    } else if (selectedIndex < MENU_COUNT - 1) {
       selectedIndex++;
       needsRedraw = true;
     }
     lastEncoderPos = newPos;
   } else if (diff <= -2) {
-    if (selectedIndex > 0) {
+    if (currentScreen == SCREEN_CONFIG) {
+      configSelectedIndex = (configSelectedIndex - 1 + CONFIG_ITEMS) % CONFIG_ITEMS;
+      needsRedraw = true;
+    } else if (selectedIndex > 0) {
       selectedIndex--;
       needsRedraw = true;
     }
     lastEncoderPos = newPos;
-  }
-  
+  }  
   // ボタン押下: 画面遷移
   if (M5Dial.BtnA.wasPressed()) {
     Serial.printf("[BTN] pressed. currentScreen=%d, selectedIndex=%d\n",
     currentScreen, selectedIndex);
     if (currentScreen == SCREEN_MENU) {
-      if (selectedIndex == 1) {        // GPS情報 → フルスクリーン遷移
+      if (selectedIndex == 1) {
         currentScreen = SCREEN_GPS;
         needsRedraw = true;
-      } else if (selectedIndex == 4) { // 設定ページでボタン → S3同期
-        syncWithS3();
-        needsRedraw = true;            // 同期後にconfigページ再描画
+      } else if (selectedIndex == 4) {
+        // ↓ S3同期から変更: SCREEN_CONFIG に遷移
+        configSelectedIndex = 0;
+        currentScreen = SCREEN_CONFIG;
+        needsRedraw = true;
       } else {
-        // その他は仮フィードバック
         M5Dial.Display.fillCircle(CX, CY, 30, menuItems[selectedIndex].color);
         delay(100);
         needsRedraw = true;
       }
+    } else if (currentScreen == SCREEN_CONFIG) {
+      // ↓ 追加: 設定画面内での項目実行
+      if (configSelectedIndex == 0) {
+        syncWithS3();
+        needsRedraw = true;
+      } else if (configSelectedIndex == 1) {
+        startAPMode();  // 内部で drawAPModePage() も呼ぶ
+      } else if (configSelectedIndex == 2) {  // ← 追加
+        tripDistAccum = 42.5;
+        startManualDistInput();
+      }
     } else {
-      // フルスクリーン → メニューに戻る
+      currentScreen = SCREEN_MENU;
+      needsRedraw = true;
+    }
+  }
+
+  // ↓ 追加: 長押しで設定画面からメニューに戻る
+  if (M5Dial.BtnA.wasHold()) {
+    if (currentScreen == SCREEN_CONFIG) {
       currentScreen = SCREEN_MENU;
       needsRedraw = true;
     }
@@ -950,6 +1045,7 @@ double calcDistance(double lat1, double lon1, double lat2, double lon2) {
 
 void updateFarthestPoint() {
   if (!gps.location.isValid()) return;
+  if (currentScreen == SCREEN_MANUAL_DIST) return;
 
   double lat = gps.location.lat();
   double lng = gps.location.lng();
@@ -957,28 +1053,71 @@ void updateFarthestPoint() {
 
   // 基準点から離れたら運行開始
   if (!tripActive && distFromBase > RETURN_RADIUS) {
+    if (millis() < tripCooldownUntil) return; 
     tripActive = true;
+    tripStartTime = millis();
     farthestLat = lat;
     farthestLng = lng;
     farthestDist = distFromBase;
+    tripDistAccum = 0.0;
+    prevPosValid = false;
+    tripStartOdometer = getOBD2Odometer();
+    Serial.printf("[Trip] 開始 odometer=%u km\n", tripStartOdometer);
   }
 
-  // 運行中: 最遠地点を更新
-  if (tripActive && distFromBase > farthestDist) {
-    farthestLat = lat;
-    farthestLng = lng;
-    farthestDist = distFromBase;
+  // 運行中: 最遠地点更新 + GPS積算
+  if (tripActive) {
+    if (distFromBase > farthestDist) {
+      farthestLat = lat;
+      farthestLng = lng;
+      farthestDist = distFromBase;
+    }
+
+    // GPS積算（5km/h以上の時のみ）
+    if (gps.speed.isValid() && gps.speed.kmph() >= 5.0) {
+      if (prevPosValid) {
+        float d = calcDistance(prevLat, prevLng, lat, lng);
+        tripDistAccum += d;
+      }
+      prevLat = lat;
+      prevLng = lng;
+      prevPosValid = true;
+    } else {
+      prevPosValid = false;  // 停車中はリセットして再発進時の誤差防止
+    }
   }
 
   // 帰社判定
   if (tripActive && distFromBase <= RETURN_RADIUS) {
-    saveTripLocal();  // ローカルに保存
-    tripActive = false;
-    farthestDist = 0.0;
+    if (millis() - tripStartTime < 60000) return;
+    uint32_t endOdometer = getOBD2Odometer();
+    uint32_t obd2Dist = (endOdometer > 0 && tripStartOdometer > 0 && endOdometer >= tripStartOdometer)
+                        ? endOdometer - tripStartOdometer
+                        : 0;
+
+    if (obd2Dist > 0) {
+      // OBD2成功 → そのまま保存
+      Serial.printf("[Trip] OBD2距離: %u km\n", obd2Dist);
+      saveTripLocal(obd2Dist);
+      resetTrip();
+    } else {
+      // OBD2失敗 → 手動入力モードへ
+      Serial.printf("[Trip] GPS積算距離: %.1f km\n", tripDistAccum);
+      startManualDistInput();
+    }
   }
 }
 
-void saveTripLocal() {
+void resetTrip() {
+  tripActive = false;
+  farthestDist = 0.0;
+  tripStartOdometer = 0;
+  tripDistAccum = 0.0;
+  prevPosValid = false;
+  tripCooldownUntil = millis() + 30000;  // ← 追加（30秒クールダウン）
+}
+
+void saveTripLocal(uint32_t distKm) {
   JsonDocument doc;
   
   File f = SPIFFS.open("/trips.json", "r");
@@ -995,11 +1134,17 @@ void saveTripLocal() {
   trip["driver_uid"]  = currentDriverUID;          // "driver" から変更
   trip["driver_name"] = lookupDriver(currentDriverUID); // 新規追加
   trip["address"] = getAddressAt(farthestLat, farthestLng);
-  trip["dist"]        = farthestDist;
+  //trip["dist"]        = farthestDist;
+  //trip["dist"]        = obd2DistKm;
+  trip["dist"]        = distKm;
   trip["lat"]         = farthestLat;
   trip["lng"]         = farthestLng;
 
   File out = SPIFFS.open("/trips.json", "w");
+  if (!out) {
+    Serial.println("[SPIFFS] trips.json open failed");
+    return;
+  }
   serializeJson(doc, out);
   out.close();
 }
@@ -1012,6 +1157,7 @@ String lookupDriver(String uid) {
   JsonDocument doc;
   deserializeJson(doc, f);
   f.close();
+  Serial.println("[SPIFFS] trips.json saved OK");  
 
   JsonArray arr = doc.as<JsonArray>();
   for (JsonObject d : arr) {
@@ -1084,14 +1230,16 @@ String getRTCDateTime() {
 }
 
 void startWiFiConnect() {
+  if (apModeActive) return;
   if (WiFi.status() == WL_CONNECTED) return;
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
   wifiConnecting = true;
   wifiConnectStart = millis();
   Serial.println("WiFi connecting...");
 }
 
 void updateWiFiStatus() {
+  if (apModeActive) return;
   if (!wifiConnecting) return;
   if (WiFi.status() == WL_CONNECTED) {
     wifiConnecting = false;
@@ -1428,6 +1576,20 @@ bool downloadDriversFromS3() {
 }
 
 void syncWithS3() {
+  Serial.printf("[S3] WiFi status=%d\n", WiFi.status());
+    // WiFi未接続なら最大10秒待機
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[S3] WiFi待機中...");
+    startWiFiConnect();
+    unsigned long wt = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - wt < 10000) {
+      delay(200);
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("[S3] WiFi接続失敗、sync中止");
+      return;
+    }
+  }
     // シークレットキーの長さと先頭4文字だけ確認（セキュリティ上これだけでOK）
   String secret = String(AWS_SECRET_ACCESS_KEY);
   Serial.printf("[S3] secret len=%d, first4=%s\n", 
@@ -1449,11 +1611,269 @@ void syncWithS3() {
     up ? "OK" : "NG", down ? "OK" : "NG");
 }
 
+// ───────────────────────────────
+// WiFi設定をSPIFFSから読み込む
+// なければ secrets.h の値をそのまま使用
+// ───────────────────────────────
+void loadWiFiConfig() {
+  if (!SPIFFS.exists("/wifi_config.json")) return;
+  File f = SPIFFS.open("/wifi_config.json", "r");
+  if (!f) return;
+  JsonDocument doc;
+  if (deserializeJson(doc, f) == DeserializationError::Ok) {
+    if (doc["ssid"].is<const char*>()) wifiSSID = doc["ssid"].as<String>();
+    if (doc["pass"].is<const char*>()) wifiPass = doc["pass"].as<String>();
+  }
+  f.close();
+}
+
+// ───────────────────────────────
+// APモード時のM5Dial画面表示
+// ───────────────────────────────
+void drawAPModePage() {
+  M5Dial.Display.fillScreen(BLACK);
+  M5Dial.Display.setTextDatum(middle_center);
+  M5Dial.Display.setTextColor(CYAN);
+  M5Dial.Display.setFont(&fonts::Font4);
+  M5Dial.Display.drawString("WiFi Setup", 120, 55);
+
+  M5Dial.Display.setTextColor(WHITE);
+  M5Dial.Display.setFont(&fonts::Font2);
+  M5Dial.Display.drawString("SSID:", 120, 90);
+  M5Dial.Display.setTextColor(YELLOW);
+  M5Dial.Display.drawString(AP_SSID, 120, 108);
+
+  M5Dial.Display.setTextColor(WHITE);
+  M5Dial.Display.drawString("URL:", 120, 130);
+  M5Dial.Display.setTextColor(YELLOW);
+  M5Dial.Display.drawString("192.168.4.1", 120, 148);
+
+  M5Dial.Display.setTextColor(TFT_DARKGREY);
+  M5Dial.Display.drawString("press to cancel", 120, 185);
+}
+
+// ───────────────────────────────
+// APモード用HTMLの生成
+// ───────────────────────────────
+String buildAPHTML(bool saved = false) {
+  if (saved) {
+    return R"rawhtml(<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{background:#181c22;color:#e2e8f0;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;}
+.card{text-align:center;padding:40px 24px;}.icon{width:56px;height:56px;background:#14532d;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 16px;font-size:24px;color:#22c55e;}
+h2{color:#22c55e;font-size:18px;margin-bottom:8px;}p{color:#64748b;font-size:13px;line-height:1.7;}</style></head>
+<body><div class="card"><div class="icon">&#10003;</div>
+<h2>保存しました</h2><p>設定を保存しました。<br>デバイスが再起動します...<br><br>再起動後はこのAPに<br>接続できなくなります。</p></div></body></html>)rawhtml";
+  }
+
+  String currentSSID = "";
+  if (SPIFFS.exists("/wifi_config.json")) {
+    File f = SPIFFS.open("/wifi_config.json", "r");
+    JsonDocument doc;
+    if (f && deserializeJson(doc, f) == DeserializationError::Ok) {
+      currentSSID = doc["ssid"].as<String>();
+    }
+    f.close();
+  }
+
+  String html = R"rawhtml(<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*{box-sizing:border-box;}body{background:#181c22;color:#e2e8f0;font-family:sans-serif;margin:0;}
+.header{background:#1e2530;padding:16px 20px;border-bottom:1px solid #2a3545;}
+.logo{display:flex;align-items:center;gap:10px;margin-bottom:4px;}
+.logo-icon{width:28px;height:28px;background:#2563eb;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:14px;}
+.logo-text{font-size:15px;font-weight:500;}.logo-sub{font-size:11px;color:#64748b;}
+.body{padding:20px;}
+.info-box{background:#1e2a3a;border:1px solid #2a3f5a;border-radius:10px;padding:12px 14px;margin-bottom:16px;font-size:12px;color:#94a3b8;line-height:1.6;}
+.current{background:#1a2535;border:1px solid #243040;border-radius:8px;padding:10px 12px;margin-bottom:16px;display:flex;justify-content:space-between;align-items:center;}
+.current-label{font-size:11px;color:#64748b;}.current-value{font-size:13px;color:#38bdf8;font-family:monospace;}
+label{font-size:11px;color:#64748b;display:block;margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em;}
+input{width:100%;background:#1e2530;border:1px solid #2a3545;border-radius:8px;padding:10px 12px;font-size:14px;color:#e2e8f0;outline:none;margin-bottom:14px;}
+input:focus{border-color:#2563eb;}
+button{width:100%;background:#2563eb;color:#fff;border:none;border-radius:8px;padding:12px;font-size:14px;font-weight:500;cursor:pointer;margin-top:4px;}
+</style></head><body>
+<div class="header"><div class="logo"><div class="logo-icon">&#9729;</div><span class="logo-text">Drive Log Cloud</span></div><div class="logo-sub">WiFi&#35373;&#23450;</div></div>
+<div class="body">
+<div class="info-box">&#25509;&#32154;&#12377;&#12427;WiFi&#12398;SSID&#12392;&#12497;&#12473;&#12527;&#12540;&#12489;&#12434;&#20837;&#21147;&#12375;&#12390;&#12367;&#12384;&#12373;&#12356;&#12290;&#20445;&#23384;&#24460;&#12289;&#12487;&#12496;&#12452;&#12473;&#12364;&#33258;&#21160;&#30340;&#12395;&#36215;&#21205;&#12375;&#12414;&#12377;&#12290;</div>)rawhtml";
+
+  if (currentSSID.length() > 0) {
+    html += "<div class='current'><div><div class='current-label'>&#29694;&#22312;&#12398;&#35373;&#23450;</div>";
+    html += "<div class='current-value'>" + currentSSID + "</div></div>";
+    html += "<span style='color:#22c55e;'>&#10003;</span></div>";
+  }
+
+  html += R"rawhtml(
+<form method="POST" action="/save">
+<label>SSID&#65288;&#12493;&#12483;&#12488;&#12527;&#12540;&#12463;&#21517;&#65289;</label>
+<input type="text" name="ssid" placeholder="&#20363;: MyWiFiNetwork" required>
+<label>&#12497;&#12473;&#12527;&#12540;&#12489;</label>
+<input type="password" name="pass" placeholder="WiFi&#12497;&#12473;&#12527;&#12540;&#12489;&#12434;&#20837;&#21147;">
+<button type="submit">&#20445;&#23384;&#12375;&#12390;&#20877;&#36215;&#21205;</button>
+</form></div></body></html>)rawhtml";
+
+  return html;
+}
+
+// ───────────────────────────────
+// APモード 開始
+// ───────────────────────────────
+void startAPMode() {
+  apModeActive = true;
+  apModeStartTime = millis();
+  wifiConnecting = false;
+
+  WiFi.setAutoReconnect(false);
+  WiFi.persistent(false);
+  WiFi.disconnect(false);
+  delay(300);
+  WiFi.mode(WIFI_AP);  // AP_STA → AP に戻す
+  delay(500);
+
+  bool result = WiFi.softAP(AP_SSID, AP_PASSWORD);
+  Serial.printf("[AP] softAP result: %s\n", result ? "OK" : "FAILED");
+  if (!result) {
+    apModeActive = false;
+    return;
+  }
+  IPAddress apIP = WiFi.softAPIP();
+  Serial.printf("[AP] IP: %d.%d.%d.%d\n", apIP[0], apIP[1], apIP[2], apIP[3]);
+  apTcpServer.stop(); 
+  apTcpServer.begin();
+  delay(500);
+  Serial.println("[AP] TCP server started");
+  drawAPModePage();
+}
+// ───────────────────────────────
+// APモード 停止
+// ───────────────────────────────
+void stopAPMode() {
+  apTcpServer.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_OFF);   // ← 追加：スタックを完全にリセット
+  delay(200);
+  WiFi.persistent(true);
+  WiFi.setAutoReconnect(true);
+  WiFi.mode(WIFI_STA);
+  apModeActive = false;
+}
+
+uint32_t getOBD2Odometer() {
+  Serial.println("[OBD2] WiFi切り替え開始");
+
+  // 現在のWiFiから切断
+  WiFi.disconnect(true);
+  delay(500);
+
+  // OBD2アダプタのAPに接続
+  WiFi.begin(OBD2_SSID, OBD2_PASS);
+  unsigned long t = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t < 10000) {
+    delay(200);
+    Serial.print(".");
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[OBD2] AP接続失敗");
+    startWiFiConnect();
+    return 0;
+  }
+  Serial.println("[OBD2] AP接続OK");
+
+  // ELM327にTCP接続
+  WiFiClient obd;
+  if (!obd.connect(OBD2_IP, OBD2_PORT)) {
+    Serial.println("[OBD2] TCP接続失敗");
+    WiFi.disconnect(true);
+    startWiFiConnect();
+    return 0;
+  }
+
+  // ELM327初期化
+  obd.print("ATZ\r");
+  delay(1000);
+  obd.readString();  // 応答を読み捨て
+
+  obd.print("ATE0\r");  // エコーオフ
+  delay(300);
+  obd.readString();
+
+  obd.print("ATSP6\r");  // ISO 15765-4 CAN 11bit 500kbaud（国産車の大多数）
+  delay(500);
+  obd.readString();
+
+  // PID 01A6（総走行距離）クエリ
+  //obd.print("01A6\r");
+  obd.print("010D\r");
+  delay(1000);
+  String resp = "";
+  unsigned long rt = millis();
+  while (millis() - rt < 3000) {
+    if (obd.available()) resp += (char)obd.read();
+    if (resp.indexOf('>') >= 0) break;
+    delay(10);
+  }
+  Serial.println("[OBD2] 応答: " + resp);
+  obd.stop();
+
+  // 元のWiFiに戻す
+  WiFi.disconnect(true);
+  delay(500);
+  startWiFiConnect();
+
+  // 応答パース: "41 A6 XX XX XX XX"
+  resp.trim();
+  int idx = resp.indexOf("41 A6");
+  if (idx < 0) {
+    Serial.println("[OBD2] パース失敗");
+    return 0;
+  }
+  String hex = resp.substring(idx + 6);
+  hex.trim();
+  hex.replace(" ", "");
+  if (hex.length() < 8) {
+    Serial.println("[OBD2] データ不足");
+    return 0;
+  }
+  uint32_t km = strtoul(hex.substring(0, 8).c_str(), nullptr, 16);
+  Serial.printf("[OBD2] オドメーター: %u km\n", km);
+  return km;
+}
+
+void startManualDistInput() {
+  manualDistKm = (uint32_t)round(tripDistAccum);
+  currentScreen = SCREEN_MANUAL_DIST;
+  drawManualDistInput();
+}
+
+void drawManualDistInput() {
+  M5Dial.Display.setFont(&fonts::lgfxJapanGothicP_16);
+  M5Dial.Display.fillScreen(0x181c22);
+
+  M5Dial.Display.setTextColor(0x38bdf8);
+  M5Dial.Display.setTextDatum(middle_center);
+  M5Dial.Display.setTextSize(1.2);
+  M5Dial.Display.drawString("走行距離を入力", 120, 60);
+
+  M5Dial.Display.setTextColor(0xe2e8f0);
+  M5Dial.Display.setTextSize(0.8);
+  M5Dial.Display.drawString("(GPS参考値)", 120, 90);
+
+  M5Dial.Display.setTextColor(0xffffff);
+  M5Dial.Display.setTextSize(2.5);
+  M5Dial.Display.drawString(String(manualDistKm) + " km", 120, 140);
+
+  M5Dial.Display.setTextColor(0x94a3b8);
+  M5Dial.Display.setTextSize(0.8);
+  M5Dial.Display.drawString("ダイヤル: ±1km", 120, 185);
+  M5Dial.Display.drawString("ボタン: 確定", 120, 205);
+}
+
 // ============================================================
 // Setup
 // ============================================================
 void setup() {
   Serial.begin(115200);
+  WiFi.persistent(false);  // ← 追加：NVSへのWiFi認証情報キャッシュを無効化
   //while (!Serial) delay(10);  // USB CDC接続待ち（これが重要）
   Serial.println("=== BOOT ===");
 
@@ -1467,6 +1887,14 @@ void setup() {
   //SPIFFS.remove("/trips.json");
   initDriversJson();  // ← 追加
 
+  // WiFi設定読込
+  loadWiFiConfig();
+  // 確認用：wifi_config.json の存在とSSIDをログ出力
+  if (SPIFFS.exists("/wifi_config.json")) {
+    Serial.println("[WiFi] config file found: " + wifiSSID);
+  } else {
+    Serial.println("[WiFi] config file not found, using secrets.h");
+  }
   // WiFi接続開始
   startWiFiConnect();
 
@@ -1504,6 +1932,10 @@ void setup() {
   // メイン画面へ遷移
   appState = STATE_MAIN;
   needsRedraw = true;
+
+  getOBD2Odometer();
+
+  tripCooldownUntil = millis() + 30000;
 }
 
 // ============================================================
@@ -1511,31 +1943,165 @@ void setup() {
 // ============================================================
 void loop() {
   M5Dial.update();
-  
-  // GPSデータ読み取り
+
+  if (apModeActive) {
+    static unsigned long lastApLog = 0;
+    if (millis() - lastApLog > 3000) {
+      Serial.printf("[AP] loop running, stations=%d\n", WiFi.softAPgetStationNum());
+      lastApLog = millis();
+    }
+
+    for (int retry = 0; retry < 5; retry++) {
+      WiFiClient client = apTcpServer.available();
+      if (!client) { delay(10); continue; }
+
+      Serial.println("[AP] client connected");
+      Serial.printf("[AP] free heap: %d\n", ESP.getFreeHeap());
+
+      char reqBuf[1024] = {0};
+      int reqLen = 0;
+      unsigned long t = millis();
+      while (client.connected() && millis() - t < 5000) {
+        if (client.available()) {
+          char c = client.read();
+          if (reqLen < 1023) reqBuf[reqLen++] = c;
+          if (reqLen >= 4 &&
+              reqBuf[reqLen-4] == '\r' && reqBuf[reqLen-3] == '\n' &&
+              reqBuf[reqLen-2] == '\r' && reqBuf[reqLen-1] == '\n') break;
+        } else { delay(5); }
+      }
+      String req = String(reqBuf);
+      Serial.println("[AP] request: " + req.substring(0, 60));
+
+      if (req.startsWith("POST /save")) {
+        int clIdx = req.indexOf("Content-Length: ");
+        int contentLength = 0;
+        if (clIdx >= 0) contentLength = req.substring(clIdx + 16).toInt();
+        Serial.printf("[AP] Content-Length: %d\n", contentLength);
+        delay(200);
+        String body = "";
+        unsigned long bt = millis();
+        while ((int)body.length() < contentLength && millis() - bt < 3000) {
+          if (client.available()) body += (char)client.read();
+          else delay(5);
+        }
+        Serial.println("[AP] body: " + body);
+
+        auto urlDecode = [](String s) {
+          String r = "";
+          for (int i = 0; i < (int)s.length(); i++) {
+            if (s[i] == '+') { r += ' '; }
+            else if (s[i] == '%' && i + 2 < (int)s.length()) {
+              char c = (char)strtol(s.substring(i+1, i+3).c_str(), nullptr, 16);
+              r += c; i += 2;
+            } else { r += s[i]; }
+          }
+          return r;
+        };
+        auto parseParam = [](String body, String key) {
+          int i = body.indexOf(key + "=");
+          if (i < 0) return String("");
+          int j = body.indexOf("&", i);
+          return (j < 0) ? body.substring(i + key.length() + 1)
+                         : body.substring(i + key.length() + 1, j);
+        };
+
+        String ssid = urlDecode(parseParam(body, "ssid"));
+        String pass = urlDecode(parseParam(body, "pass"));
+        Serial.println("[AP] ssid=" + ssid + " pass=" + pass);
+
+        if (ssid.length() > 0) {
+          File f = SPIFFS.open("/wifi_config.json", "w");
+          if (f) {
+            JsonDocument doc;
+            doc["ssid"] = ssid;
+            doc["pass"] = pass;
+            serializeJson(doc, f);
+            f.close();
+            Serial.println("[AP] wifi_config.json saved");
+            const char* html =
+              "<html><head><meta charset='utf-8'></head>"
+              "<body style='background:#181c22;color:#e2e8f0;font-family:sans-serif;padding:40px;text-align:center'>"
+              "<h2 style='color:#22c55e'>&#20445;&#23384;&#12375;&#12414;&#12375;&#12383;</h2>"
+              "<p>&#20877;&#36215;&#21205;&#12375;&#12414;&#12377;...</p></body></html>";
+            client.println("HTTP/1.1 200 OK");
+            client.println("Content-Type: text/html; charset=utf-8");
+            client.println("Connection: close");
+            client.println();
+            client.print(html);
+            client.flush();
+            delay(100);
+            client.stop();
+            delay(2000);
+            ESP.restart();
+          } else {
+            Serial.println("[AP] SPIFFS open failed");
+            client.println("HTTP/1.1 500 Internal Server Error");
+            client.println("Connection: close");
+            client.println();
+            client.stop();
+          }
+        } else {
+          Serial.println("[AP] ssid empty, redirecting");
+          client.println("HTTP/1.1 302 Found");
+          client.println("Location: http://192.168.4.1:8080/");
+          client.println("Connection: close");
+          client.println();
+          client.stop();
+        }
+      } else {
+        const char* body =
+          "<html><head><meta charset='utf-8'>"
+          "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+          "</head><body style='background:#181c22;color:#e2e8f0;font-family:sans-serif;padding:20px'>"
+          "<h2 style='color:#38bdf8'>Drive Log Cloud - WiFi&#35373;&#23450;</h2>"
+          "<form method='POST' action='/save'>"
+          "<p>SSID<br><input name='ssid' style='width:100%;padding:8px;margin-bottom:12px'></p>"
+          "<p>&#12497;&#12473;&#12527;&#12540;&#12489;<br><input name='pass' type='password' style='width:100%;padding:8px;margin-bottom:12px'></p>"
+          "<input type='submit' value='&#20445;&#23384;&#12375;&#12390;&#20877;&#36215;&#21205;' "
+          "style='width:100%;padding:12px;background:#2563eb;color:#fff;border:none;border-radius:8px'>"
+          "</form></body></html>";
+        Serial.printf("[AP] sending %d bytes\n", (int)strlen(body));
+        client.println("HTTP/1.1 200 OK");
+        client.println("Content-Type: text/html; charset=utf-8");
+        client.println("Connection: close");
+        client.println();
+        client.print(body);
+        client.flush();
+        delay(100);
+        client.stop();
+        Serial.println("[AP] response sent");
+      }
+      break;
+    }
+
+    if (millis() - apModeStartTime > 3000 && M5Dial.BtnA.wasPressed()) {
+      stopAPMode();
+      startWiFiConnect();
+      currentScreen = SCREEN_CONFIG;
+      drawConfigPage();
+    }
+    return;
+  }
+    
   while (gpsSerial.available() > 0) {
     gps.encode(gpsSerial.read());
   }
-  syncRTCFromGPS();  // GPS有効になったら1回だけRTCに同期
+  syncRTCFromGPS();
 
   updateWiFiStatus();
   updateAddress();
 
-  // 最遠地点更新
   updateFarthestPoint();
 
   if (appState == STATE_MAIN) {
-    // NFC読み取り（常時ポーリング＝どの画面でもカードタッチ受付）
     pollNFC();
-    
     handleInput();
-        // GPS画面の定期更新（1秒ごと）
     static unsigned long lastGPSRedraw = 0;
     if (currentScreen == SCREEN_GPS && millis() - lastGPSRedraw > 1000) {
       drawGPSInfo();
       lastGPSRedraw = millis();
     }
-
     if (needsRedraw) {
       switch (currentScreen) {
         case SCREEN_MENU:   drawMainScreen();  break;
@@ -1543,6 +2109,7 @@ void loop() {
         case SCREEN_OBD2:   drawOBD2Page();    break;
         case SCREEN_DRIVER: drawDriverPage();  break;
         case SCREEN_CONFIG: drawConfigPage();  break;
+        case SCREEN_MANUAL_DIST: drawManualDistInput(); break;
       }
       needsRedraw = false;
     }

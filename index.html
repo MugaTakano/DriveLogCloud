@@ -621,7 +621,7 @@
           <div class="editor-header">drivers.json 操作</div>
           <div class="editor-body">
             <p style="font-size:12px;color:var(--text-dim);line-height:1.7;margin-bottom:14px">
-              ドライバー情報を編集後、JSONをダウンロードしてS3に手動アップロードしてください。
+              S3に直接保存されます。バックアップ用にダウンロードも可能です。
             </p>
             <button class="btn btn-accent btn-full" onclick="downloadDriversJson()" style="width:100%;text-align:center;display:block">drivers.json ダウンロード</button>
           </div>
@@ -641,7 +641,9 @@
 const S3_BASE = 'https://dshomqga50xmk.cloudfront.net';
 const TRIPS_URL   = `${S3_BASE}/trips.json`;
 const DRIVERS_URL = `${S3_BASE}/drivers.json`;
-
+let tripsStatus   = { text: 'loading...', isErr: false };
+let driversStatus = { text: 'loading...', isErr: false };
+let currentTab    = 'trips';
 // ──────────────────────────────────────
 // STATE
 // ──────────────────────────────────────
@@ -666,17 +668,27 @@ async function loadTrips() {
 
   try {
     const r = await fetch(TRIPS_URL + '?t=' + Date.now());
+    if (r.status === 404 || r.status === 403) {
+      tripsStatus = { text: 'error', isErr: true };
+      setStatus('error', true);  // currentTab条件を外す
+      document.getElementById('trips-loading').style.display = 'none';
+      document.getElementById('trips-empty').style.display   = 'block';
+      document.getElementById('trips-empty').textContent     = '運行記録がありません（trips.json未作成）';
+      return;
+    }
     if (!r.ok) throw new Error(r.status);
     const data = await r.json();
     tripsData = Array.isArray(data) ? data : [];
-    renderTrips();
+    tripsStatus = { text: 'ok', isErr: false };
     setStatus('ok');
+    renderTrips();
   } catch (e) {
     tripsData = [];
     document.getElementById('trips-loading').style.display = 'none';
     document.getElementById('trips-empty').style.display   = 'block';
     document.getElementById('trips-empty').textContent     = `読み込みエラー: ${e.message}`;
-    setStatus('error', true);
+    tripsStatus = { text: 'error', isErr: true };
+    setStatus('error', true);  // if (currentTab === 'trips') を外すだけ
   }
 }
 
@@ -687,14 +699,28 @@ async function loadDrivers() {
 
   try {
     const r = await fetch(DRIVERS_URL + '?t=' + Date.now());
+    if (r.status === 404 || r.status === 403) {
+      driversData = [];
+      driversStatus = { text: 'error', isErr: true };
+      if (currentTab === 'drivers') setStatus('error', true);
+      document.getElementById('drivers-loading').style.display = 'none';
+      document.getElementById('drivers-empty').style.display   = 'block';
+      document.getElementById('drivers-empty').textContent     = 'ドライバー情報がありません（drivers.json未作成）';
+      return;
+    }
     if (!r.ok) throw new Error(r.status);
     const data = await r.json();
     driversData = Array.isArray(data) ? data : [];
+    driversStatus = { text: 'ok', isErr: false };
+    if (currentTab === 'drivers') setStatus('ok');
     renderDrivers();
   } catch (e) {
     driversData = [];
+    driversStatus = { text: 'error', isErr: true };
+    if (currentTab === 'drivers') setStatus('error', true);
     document.getElementById('drivers-loading').style.display = 'none';
     document.getElementById('drivers-empty').style.display   = 'block';
+    document.getElementById('drivers-empty').textContent     = `読み込みエラー: ${e.message}`;
   }
 }
 
@@ -836,6 +862,7 @@ function renderDrivers() {
 
   if (driversData.length === 0) {
     document.getElementById('drivers-empty').style.display = 'block';
+    document.getElementById('drivers-empty').textContent   = 'ドライバーが登録されていません';
     document.getElementById('drivers-list').innerHTML = '';
     return;
   }
@@ -865,7 +892,6 @@ function startAdd() {
   document.getElementById('edit-name').value  = '';
   document.getElementById('edit-uid').value   = '';
   document.getElementById('editor-title').textContent  = 'ドライバー追加';
-  document.getElementById('download-notice').style.display = 'none';
   document.getElementById('editor-card').style.display = 'block';
   document.getElementById('edit-name').focus();
 }
@@ -876,7 +902,6 @@ function startEdit(i) {
   document.getElementById('edit-name').value  = d.name || '';
   document.getElementById('edit-uid').value   = d.uid  || '';
   document.getElementById('editor-title').textContent  = 'ドライバー編集';
-  document.getElementById('download-notice').style.display = 'none';
   document.getElementById('editor-card').style.display = 'block';
   document.getElementById('edit-name').focus();
 }
@@ -885,30 +910,67 @@ function closeEditor() {
   document.getElementById('editor-card').style.display = 'none';
 }
 
-function saveDriver() {
+async function saveDriver() {
   const name = document.getElementById('edit-name').value.trim();
   const uid  = document.getElementById('edit-uid').value.trim().toUpperCase();
   const idx  = parseInt(document.getElementById('edit-index').value);
 
   if (!name || !uid) { toast('名前とUIDを入力してください', 'warn'); return; }
 
+  toast('S3に保存中...', '');
+
+  // 送信用データを作成（driversDataは直接変更しない）
+  const newData = [...driversData];
   if (idx === -1) {
-    driversData.push({ uid, name });
+    newData.push({ uid, name });
   } else {
-    driversData[idx] = { uid, name };
+    newData[idx] = { uid, name };
   }
 
-  renderDrivers();
-  document.getElementById('download-notice').style.display = 'block';
-  toast('保存しました（JSONのダウンロードをお忘れなく）', 'accent');
+  try {
+    const res = await fetch('https://zhdtfl2dl5.execute-api.us-east-1.amazonaws.com/drivers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(newData)
+    });
+    const json = await res.json();
+    if (res.ok) {
+      driversData = newData;  // 成功後に反映
+      renderDrivers();
+      closeEditor();  // 追加
+      toast('S3に保存しました', 'accent');
+    } else {
+      toast('保存失敗: ' + JSON.stringify(json), 'warn');
+    }
+  } catch (e) {
+    toast('通信エラー: ' + e.message, 'warn');
+  }
 }
 
-function deleteDriver(i) {
+async function deleteDriver(i) {
   if (!confirm(`「${driversData[i].name}」を削除しますか？`)) return;
-  driversData.splice(i, 1);
-  renderDrivers();
-  document.getElementById('download-notice').style.display = 'block';
-  toast('削除しました（JSONのダウンロードをお忘れなく）', 'warn');
+  closeEditor();
+
+  toast('S3に保存中...', '');
+
+  const newData = driversData.filter((_, idx) => idx !== i);
+
+  try {
+    const res = await fetch('https://zhdtfl2dl5.execute-api.us-east-1.amazonaws.com/drivers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(newData)
+    });
+    if (res.ok) {
+      driversData = newData;  // 成功後に反映
+      renderDrivers();
+      toast('削除してS3に保存しました', 'warn');
+    } else {
+      toast('削除失敗', 'warn');
+    }
+  } catch (e) {
+    toast('通信エラー: ' + e.message, 'warn');
+  }
 }
 
 function downloadDriversJson() {
@@ -925,13 +987,25 @@ function downloadDriversJson() {
 // UI HELPERS
 // ──────────────────────────────────────
 function switchTab(name, el) {
+  currentTab = name;
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
   el.classList.add('active');
   document.getElementById('panel-' + name).classList.add('active');
+
+  // タブのステータスを反映
+  const s = name === 'trips' ? tripsStatus : driversStatus;
+  const badge = document.getElementById('status-badge');
+  badge.textContent = s.text;
+  badge.className   = 'status-badge' + (s.text === 'ok' ? ' ok' : s.isErr ? ' err' : '');
 }
 
 function setStatus(text, isErr = false) {
+  if (currentTab === 'trips') {
+    tripsStatus = { text, isErr };
+  } else {
+    driversStatus = { text, isErr };
+  }
   const el = document.getElementById('status-badge');
   el.textContent = text;
   el.className   = 'status-badge' + (text === 'ok' ? ' ok' : isErr ? ' err' : '');

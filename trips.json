@@ -1,0 +1,110 @@
+[
+  {
+    "date": "2026-03-04",
+    "driver_uid": "A1:B2:C3:D4",
+    "driver_name": "佐藤 健一",
+    "address": "北見市常盤町",
+    "dist": 4200.0,
+    "lat": 43.8312,
+    "lng": 143.8901
+  },
+  {
+    "date": "2026-03-04",
+    "driver_uid": "E5:F6:G7:H8",
+    "driver_name": "鈴木 誠",
+    "address": "北見市北進町",
+    "dist": 8750.0,
+    "lat": 43.8654,
+    "lng": 143.8445
+  },
+  {
+    "date": "2026-03-05",
+    "driver_uid": "A1:B2:C3:D4",
+    "driver_name": "佐藤 健一",
+    "address": "訓子府町訓子府",
+    "dist": 21300.0,
+    "lat": 43.6952,
+    "lng": 143.7011
+  },
+  {
+    "date": "2026-03-05",
+    "driver_uid": "I9:J0:K1:L2",
+    "driver_name": "田中 雄大",
+    "address": "北見市端野町",
+    "dist": 6600.0,
+    "lat": 43.8921,
+    "lng": 143.9012
+  },
+  {
+    "date": "2026-03-06",
+    "driver_uid": "E5:F6:G7:H8",
+    "driver_name": "鈴木 誠",
+    "address": "美幌町仲町",
+    "dist": 35800.0,
+    "lat": 43.8297,
+    "lng": 144.1051
+  },
+  {
+    "date": "2026-03-06",
+    "driver_uid": "M3:N4:O5:P6",
+    "driver_name": "高橋 亮",
+    "address": "北見市常盤町",
+    "dist": 3900.0,
+    "lat": 43.8298,
+    "lng": 143.8876
+  },
+  {
+    "date": "2026-03-07",
+    "driver_uid": "I9:J0:K1:L2",
+    "driver_name": "田中 雄大",
+    "address": "網走市南三条東",
+    "dist": 52400.0,
+    "lat": 44.0180,
+    "lng": 144.2733
+  },
+  {
+    "date": "2026-03-07",
+    "driver_uid": "A1:B2:C3:D4",
+    "driver_name": "佐藤 健一",
+    "address": "北見市卸町",
+    "dist": 5100.0,
+    "lat": 43.8441,
+    "lng": 143.9120
+  },
+  {
+    "date": "2026-03-10",
+    "driver_uid": "M3:N4:O5:P6",
+    "driver_name": "高橋 亮",
+    "address": "置戸町置戸",
+    "dist": 44600.0,
+    "lat": 43.5611,
+    "lng": 143.6043
+  },
+  {
+    "date": "2026-03-10",
+    "driver_uid": "E5:F6:G7:H8",
+    "driver_name": "鈴木 誠",
+    "address": "北見市北進町",
+    "dist": 9200.0,
+    "lat": 43.8701,
+    "lng": 143.8512
+  },
+  {
+    "date": "2026-03-11",
+    "driver_uid": "Q7:R8:S9:T0",
+    "driver_name": "",
+    "address": "北見市緑ケ丘",
+    "dist": 7300.0,
+    "lat": 43.8523,
+    "lng": 143.9234
+  },
+  {
+    "date": "2026-03-11",
+    "driver_uid": "I9:J0:K1:L2",
+    "driver_name": "田中 雄大",
+    "address": "北見市端野町",
+    "dist": 6800.0,
+    "lat": 43.8934,
+    "lng": 143.9055
+  }
+]
