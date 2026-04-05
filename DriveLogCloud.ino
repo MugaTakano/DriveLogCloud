@@ -294,7 +294,7 @@ const unsigned long WIFI_TIMEOUT = 10000;  // 10秒タイムアウト
 String wifiSSID = WIFI_SSID;
 String wifiPass = WIFI_PASS;
 int configSelectedIndex = 0;
-const int CONFIG_ITEMS = 3;
+const int CONFIG_ITEMS = 4;
 
 // APモード
 //WebServer apServer(80);
@@ -316,19 +316,23 @@ const unsigned long ADDRESS_INTERVAL = 30000;  // 30秒ごとに更新
 #define GPS_RX 1  // PORT.A: GPS TX → M5Dial G1
 #define GPS_TX 2  // PORT.A: GPS RX → M5Dial G2
 
-// 基準点（会社座標）
-#define BASE_LAT 43.804443
-#define BASE_LNG 143.892911
-#define RETURN_RADIUS 150.0  // 帰社判定半径（メートル）
+// 変更後
+//double baseLat = 43.804443;  // デフォルト値（SPIFFS未保存時のフォールバック）
+double baseLat = 43.8023501;
+//double baseLng = 143.892911;
+double baseLng = 143.816459;
+#define RETURN_RADIUS 150.0  
 
 // 最遠地点記録
 double farthestLat = 0.0;
 double farthestLng = 0.0;
 double farthestDist = 0.0;
 
-// 運行状態
+// --- 運行中ステータス永続化 ---
 bool tripActive = false;
-
+String currentDriverName = "";
+unsigned long lastTripStateSave = 0;
+const unsigned long TRIP_STATE_SAVE_INTERVAL = 30000UL; // 30秒
 unsigned long tripCooldownUntil = 0;
 unsigned long tripStartTime = 0;
 
@@ -336,6 +340,7 @@ float tripDistAccum = 0.0;   // 積算走行距離(km)
 double prevLat = 0.0;
 double prevLng = 0.0;
 bool prevPosValid = false;
+uint32_t lastOdometer = 0;  // 前回終了時のオドメーター値
 
 uint32_t manualDistKm = 0;  // 手動入力中の距離値
 
@@ -347,7 +352,6 @@ unsigned long apModeStartTime = 0;
 
 // ドライバー情報
 String currentDriverUID = "";
-String currentDriverName = "";
 String displayUID = "";
 bool nfcReady = false;
 unsigned long lastNfcRead = 0;
@@ -602,7 +606,8 @@ void pollNFC() {
   if (uid.length() > 0) {
     currentDriverUID = uid;
     displayUID = uid;
-    currentDriverName = lookupDriver(uid);  // ← 追加
+    currentDriverName = lookupDriver(uid);
+    saveTripState(); // ← 追加：NFC読み取り時は即時保存
     Serial.printf("NFC: UID=%s -> %s\n", uid.c_str(), currentDriverName.c_str());
     
     // ブザーフィードバック
@@ -753,7 +758,7 @@ void drawGpsPage() {
   
   // 基準点からの現在距離
   if (gps.location.isValid()) {
-    double currentDist = calcDistance(BASE_LAT, BASE_LNG, gps.location.lat(), gps.location.lng());
+    double currentDist = calcDistance(baseLat, baseLng, gps.location.lat(), gps.location.lng());
     M5Dial.Display.setTextColor(0x3186);
     char curDistBuf[24];
     snprintf(curDistBuf, sizeof(curDistBuf), "現在: %.0f m", currentDist);
@@ -860,19 +865,25 @@ void drawConfigPage() {
   // デバッグ: 手動入力テスト ← 追加
   M5Dial.Display.setTextColor(configSelectedIndex == 2 ? TFT_WHITE : 0x3186);
   M5Dial.Display.drawString("[DBG]手動入力", CX, CY + 42);
+  
+  // 基準地点設定
+  M5Dial.Display.setTextColor(configSelectedIndex == 3 ? TFT_WHITE : 0x3186);
+  M5Dial.Display.drawString("現在地を基準に設定", CX, CY + 58);  // ← ここはCY+42から-4ずつずらした方が良いかも要調整
 
   // 選択インジケーター（テキストの左横に小さい丸）
   // 選択インジケーター：両方を一旦黒で消してから選択中だけ白で描く
   M5Dial.Display.fillCircle(CX - 45, CY + 2,  3, BLACK);
   M5Dial.Display.fillCircle(CX - 45, CY + 22, 3, BLACK);
   M5Dial.Display.fillCircle(CX - 45, CY + 42, 3, BLACK);
-  int indicatorY = (configSelectedIndex == 0) ? CY + 2 :
-                 (configSelectedIndex == 1) ? CY + 22 : CY + 42;
+  M5Dial.Display.fillCircle(CX - 45, CY + 58, 3, BLACK); 
+  int indicatorY = (configSelectedIndex == 0) ? CY + 2  :
+                   (configSelectedIndex == 1) ? CY + 22 :
+                   (configSelectedIndex == 2) ? CY + 42 : CY + 58;  // ← 修正
   M5Dial.Display.fillCircle(CX - 45, indicatorY, 3, TFT_WHITE);
 
   M5Dial.Display.setFont(&fonts::Font2);
   M5Dial.Display.setTextColor(TFT_DARKGREY);
-  M5Dial.Display.drawString("long press: back", CX, CY + 62);
+  M5Dial.Display.drawString("long press: back", CX, CY + 68);
 }
 
 // ============================================================
@@ -881,20 +892,18 @@ void drawConfigPage() {
 void handleInput() {
 
   if (currentScreen == SCREEN_MANUAL_DIST) {
-    // エンコーダで±1km
-    auto enc = M5Dial.Encoder.read();
-    M5Dial.Encoder.write(0);
-    if (enc >= 2) {
+    long newPos = M5Dial.Encoder.read();
+    long diff = newPos - lastEncoderPos;
+    if (diff >= 2) {
       manualDistKm++;
       drawManualDistInput();
-    } else if (enc <= -2) {
+      lastEncoderPos = newPos;
+    } else if (diff <= -2) {
       if (manualDistKm > 0) manualDistKm--;
       drawManualDistInput();
+      lastEncoderPos = newPos;
     }
-
-    // 短押しで確定
     if (M5Dial.BtnA.wasPressed()) {
-      lastEncoderPos = M5Dial.Encoder.read();
       Serial.printf("[Trip] 手動入力確定: %u km\n", manualDistKm);
       saveTripLocal(manualDistKm);
       resetTrip();
@@ -971,6 +980,22 @@ void handleInput() {
       } else if (configSelectedIndex == 2) {  // ← 追加
         tripDistAccum = 42.5;
         startManualDistInput();
+      } else if (configSelectedIndex == 3) {
+        if (gps.location.isValid()) {
+          baseLat = gps.location.lat();
+          baseLng = gps.location.lng();
+          saveBaseConfig();
+          clearTripState();  // ← 追加：基準地点変更時に運行中ステータスをリセット
+          tripActive = false;
+          tripStartTime = 0;
+          tripDistAccum = 0.0;
+          Serial.printf("[Base] updated: %.6f, %.6f\n", baseLat, baseLng);
+          M5Dial.Speaker.tone(1000, 200);
+        } else {
+          Serial.println("[Base] GPS not valid, skipped");
+          M5Dial.Speaker.tone(300, 500);
+        }
+        needsRedraw = true;
       }
     } else {
       currentScreen = SCREEN_MENU;
@@ -1049,7 +1074,7 @@ void updateFarthestPoint() {
 
   double lat = gps.location.lat();
   double lng = gps.location.lng();
-  double distFromBase = calcDistance(BASE_LAT, BASE_LNG, lat, lng);
+  double distFromBase = calcDistance(baseLat, baseLng, lat, lng);
 
   // 基準点から離れたら運行開始
   if (!tripActive && distFromBase > RETURN_RADIUS) {
@@ -1109,6 +1134,7 @@ void updateFarthestPoint() {
 }
 
 void resetTrip() {
+  clearTripState(); // ← 追加：帰社保存完了後にファイル削除
   tripActive = false;
   farthestDist = 0.0;
   tripStartOdometer = 0;
@@ -1136,7 +1162,10 @@ void saveTripLocal(uint32_t distKm) {
   trip["address"] = getAddressAt(farthestLat, farthestLng);
   //trip["dist"]        = farthestDist;
   //trip["dist"]        = obd2DistKm;
-  trip["dist"]        = distKm;
+  //trip["dist"]        = distKm;
+  doc["odometer"] = distKm;
+  lastOdometer    = distKm;  // ← 追加：次回起動時のために保持
+  saveTripState();            // ← 追加：last_odometerをSPIFFSに反映
   trip["lat"]         = farthestLat;
   trip["lng"]         = farthestLng;
 
@@ -1147,6 +1176,76 @@ void saveTripLocal(uint32_t distKm) {
   }
   serializeJson(doc, out);
   out.close();
+}
+// trip_state.json をSPIFFSに保存
+void saveTripState() {
+  JsonDocument doc;
+  doc["status"]          = (tripStartTime != 0) ? "active" : "idle";
+  doc["last_odometer"]   = lastOdometer;
+  doc["driver_uid"]      = currentDriverUID;
+  doc["driver_name"]     = currentDriverName;
+  doc["farthest_lat"]    = farthestLat;
+  doc["farthest_lng"]    = farthestLng;
+  doc["trip_dist_accum"] = tripDistAccum;
+  auto dt = M5Dial.Rtc.getDateTime();
+  char dateStr[11];
+  snprintf(dateStr, sizeof(dateStr), "%04d-%02d-%02d",
+           dt.date.year, dt.date.month, dt.date.date);
+  doc["trip_start_date"] = dateStr;
+
+  File f = SPIFFS.open("/trip_state.json", FILE_WRITE);
+  if (f) {
+    serializeJson(doc, f);
+    f.close();
+    Serial.println("[TripState] saved");
+  } else {
+    Serial.println("[TripState] save FAILED");
+  }
+}
+
+bool loadTripState() {
+  if (!SPIFFS.exists("/trip_state.json")) return false;
+  File f = SPIFFS.open("/trip_state.json", FILE_READ);
+  if (!f) return false;
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, f);
+  f.close();
+  if (err) {
+    Serial.println("[TripState] parse error");
+    return false;
+  }
+
+  // last_odometerは常に読み込む（idle時も必要）
+  lastOdometer = doc["last_odometer"] | 0;
+
+  String status = doc["status"] | String("idle");
+  if (status != "active") {
+    Serial.printf("[TripState] status=idle, last_odometer=%u\n", lastOdometer);
+    return false;
+  }
+
+  currentDriverUID  = doc["driver_uid"]      | String("");
+  currentDriverName = doc["driver_name"]     | String("");
+  farthestLat       = doc["farthest_lat"]    | 0.0;
+  farthestLng       = doc["farthest_lng"]    | 0.0;
+  tripDistAccum     = doc["trip_dist_accum"] | 0.0f;
+  tripStartTime     = millis() - 120000UL;
+  tripActive        = true;
+  Serial.printf("[TripState] restored: driver=%s lat=%.4f lng=%.4f dist=%.1fkm odometer=%u\n",
+                currentDriverName.c_str(), farthestLat, farthestLng, tripDistAccum, lastOdometer);
+  return true;
+}
+
+void clearTripState() {
+  tripActive        = false;
+  tripStartTime     = 0;
+  tripDistAccum     = 0.0;
+  currentDriverUID  = "";
+  currentDriverName = "";
+  farthestLat       = 0.0;
+  farthestLng       = 0.0;
+  saveTripState();  // status="idle"・last_odometerは保持したまま保存
+  Serial.println("[TripState] cleared to idle");
 }
 
 // ドライバーマスタからUID照合
@@ -1840,9 +1939,11 @@ uint32_t getOBD2Odometer() {
 }
 
 void startManualDistInput() {
-  manualDistKm = (uint32_t)round(tripDistAccum);
+  manualDistKm = lastOdometer;  // ← tripDistAccum から変更
   currentScreen = SCREEN_MANUAL_DIST;
-  drawManualDistInput();
+  needsRedraw = true;
+  M5Dial.Encoder.write(0);
+  lastEncoderPos = 0;
 }
 
 void drawManualDistInput() {
@@ -1852,7 +1953,7 @@ void drawManualDistInput() {
   M5Dial.Display.setTextColor(0x38bdf8);
   M5Dial.Display.setTextDatum(middle_center);
   M5Dial.Display.setTextSize(1.2);
-  M5Dial.Display.drawString("走行距離を入力", 120, 60);
+  M5Dial.Display.drawString("終了時メーター値を入力", 120, 60);
 
   M5Dial.Display.setTextColor(0xe2e8f0);
   M5Dial.Display.setTextSize(0.8);
@@ -1867,6 +1968,32 @@ void drawManualDistInput() {
   M5Dial.Display.drawString("ダイヤル: ±1km", 120, 185);
   M5Dial.Display.drawString("ボタン: 確定", 120, 205);
 }
+
+void saveBaseConfig() {
+  JsonDocument doc;
+  doc["lat"] = baseLat;
+  doc["lng"] = baseLng;
+  File f = SPIFFS.open("/base_config.json", FILE_WRITE);
+  if (f) {
+    serializeJson(doc, f);
+    f.close();
+    Serial.printf("[Base] saved: %.6f, %.6f\n", baseLat, baseLng);
+  }
+}
+
+void loadBaseConfig() {
+  if (!SPIFFS.exists("/base_config.json")) return;
+  File f = SPIFFS.open("/base_config.json", FILE_READ);
+  if (!f) return;
+  JsonDocument doc;
+  if (deserializeJson(doc, f) == DeserializationError::Ok) {
+    baseLat = doc["lat"] | baseLat;
+    baseLng = doc["lng"] | baseLng;
+    Serial.printf("[Base] loaded: %.6f, %.6f\n", baseLat, baseLng);
+  }
+  f.close();
+}
+
 
 // ============================================================
 // Setup
@@ -1936,6 +2063,11 @@ void setup() {
   getOBD2Odometer();
 
   tripCooldownUntil = millis() + 30000;
+
+  // 運行中ステータスの復元（電源断またぎ対応）
+  if (loadTripState()) {
+    Serial.println("[TripState] trip resumed from previous session");
+  }
 }
 
 // ============================================================
@@ -1943,7 +2075,12 @@ void setup() {
 // ============================================================
 void loop() {
   M5Dial.update();
-
+  // trip_state.json 定期保存（30秒間隔）
+  if (tripStartTime != 0 &&
+      millis() - lastTripStateSave > TRIP_STATE_SAVE_INTERVAL) {
+    saveTripState();
+    lastTripStateSave = millis();
+  }
   if (apModeActive) {
     static unsigned long lastApLog = 0;
     if (millis() - lastApLog > 3000) {
@@ -2050,6 +2187,11 @@ void loop() {
           client.stop();
         }
       } else {
+        // 空リクエストは無視
+        if (req.length() < 4) {
+          client.stop();
+          break;
+        }
         const char* body =
           "<html><head><meta charset='utf-8'>"
           "<meta name='viewport' content='width=device-width,initial-scale=1'>"
