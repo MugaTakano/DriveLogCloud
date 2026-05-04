@@ -952,8 +952,14 @@ void handleInput() {
     }
     lastEncoderPos = newPos;
   }  
-  // ボタン押下: 画面遷移
-  if (M5Dial.BtnA.wasPressed()) {
+
+  // ↓ wasHold()を先に評価、else ifでつなぐことで排他処理
+  if (M5Dial.BtnA.wasHold()) {
+    if (currentScreen == SCREEN_CONFIG) {
+      currentScreen = SCREEN_MENU;
+      needsRedraw = true;
+    }
+  } else if (M5Dial.BtnA.wasPressed()) {
     Serial.printf("[BTN] pressed. currentScreen=%d, selectedIndex=%d\n",
     currentScreen, selectedIndex);
     if (currentScreen == SCREEN_MENU) {
@@ -998,14 +1004,6 @@ void handleInput() {
         needsRedraw = true;
       }
     } else {
-      currentScreen = SCREEN_MENU;
-      needsRedraw = true;
-    }
-  }
-
-  // ↓ 追加: 長押しで設定画面からメニューに戻る
-  if (M5Dial.BtnA.wasHold()) {
-    if (currentScreen == SCREEN_CONFIG) {
       currentScreen = SCREEN_MENU;
       needsRedraw = true;
     }
